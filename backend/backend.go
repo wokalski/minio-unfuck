@@ -10,9 +10,9 @@ import (
 
 	"github.com/johannesboyne/gofakes3"
 
-	"github.com/minio/minio/internal/erasure"
-	"github.com/minio/minio/internal/metadata"
-	"github.com/minio/minio/internal/xlmeta"
+	"github.com/wokalski/minio-unfuck/erasure"
+	"github.com/wokalski/minio-unfuck/metadata"
+	"github.com/wokalski/minio-unfuck/xlmeta"
 )
 
 // Backend implements gofakes3.Backend using SQLite for metadata and erasure decoding for data

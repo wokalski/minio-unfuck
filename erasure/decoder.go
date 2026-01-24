@@ -9,7 +9,7 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 
-	"github.com/minio/minio/internal/xlmeta"
+	"github.com/wokalski/minio-unfuck/xlmeta"
 )
 
 // Decoder handles erasure decoding for objects

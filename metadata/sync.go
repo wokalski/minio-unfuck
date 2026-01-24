@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/minio/internal/xlmeta"
+	"github.com/wokalski/minio-unfuck/xlmeta"
 )
 
 // SyncConfig configures the sync process

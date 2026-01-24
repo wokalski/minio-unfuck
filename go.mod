@@ -1,4 +1,4 @@
-module github.com/minio/minio
+module github.com/wokalski/minio-unfuck
 
 go 1.24
 

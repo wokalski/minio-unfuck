@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/minio/minio/internal/erasure"
+	"github.com/wokalski/minio-unfuck/erasure"
 )
 
 func main() {

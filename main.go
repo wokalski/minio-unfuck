@@ -11,9 +11,9 @@ import (
 
 	"github.com/johannesboyne/gofakes3"
 
-	"github.com/minio/minio/internal/backend"
-	"github.com/minio/minio/internal/erasure"
-	"github.com/minio/minio/internal/metadata"
+	"github.com/wokalski/minio-unfuck/backend"
+	"github.com/wokalski/minio-unfuck/erasure"
+	"github.com/wokalski/minio-unfuck/metadata"
 )
 
 func main() {
