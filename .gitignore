@@ -3,3 +3,4 @@ new/
 *.wav
 .disks
 .direnv
+.DS_Store

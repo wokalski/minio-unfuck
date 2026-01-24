@@ -349,9 +349,9 @@ func NewXLStorage(ep Endpoint, cleanUp bool) (s *XlStorage, err error) {
 			dcinfo.UsedInodes = di.Files - di.Ffree
 			dcinfo.FreeInodes = di.Ffree
 			dcinfo.FSType = di.FSType
-			if root {
-				return dcinfo, errDriveIsRoot
-			}
+			// if root {
+			// 	return dcinfo, errDriveIsRoot
+			// }
 
 			diskID, err := s.GetDiskID()
 			// Healing is 'true' when

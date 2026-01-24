@@ -190,6 +190,7 @@ require (
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/jedib0t/go-pretty/v6 v6.6.7 // indirect
 	github.com/jessevdk/go-flags v1.6.1 // indirect
+	github.com/johannesboyne/gofakes3 v0.0.0-20250916175020-ebf3e50324d3 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
 	github.com/kr/fs v0.1.0 // indirect
@@ -238,6 +239,7 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rjeczalik/notify v0.9.3 // indirect
 	github.com/rs/xid v1.6.0 // indirect
+	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/safchain/ethtool v0.5.10 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
@@ -263,6 +265,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.35.0 // indirect
 	go.opentelemetry.io/otel/sdk/metric v1.35.0 // indirect
 	go.opentelemetry.io/otel/trace v1.35.0 // indirect
+	go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/mod v0.24.0 // indirect
 	golang.org/x/net v0.39.0 // indirect
