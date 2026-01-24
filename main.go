@@ -36,22 +36,25 @@ func main() {
 		cancel()
 	}()
 
-	// Discover disks and pool configuration
+	// Discover disks and cluster configuration
 	log.Printf("Discovering disks in %s...", *rootDir)
-	pool, err := erasure.DiscoverPoolInDirectory(*rootDir)
+	cluster, err := erasure.DiscoverClusterInDirectory(*rootDir)
 	if err != nil {
 		log.Fatalf("Failed to discover disks: %v", err)
 	}
 
-	log.Printf("Discovered pool %s with %d erasure set(s)", pool.PoolID, pool.SetCount)
-	for setIdx, set := range pool.Sets {
-		available := 0
-		for _, disk := range set {
-			if disk.Path != "" {
-				available++
+	log.Printf("Discovered %d pool(s) with %d total erasure set(s)", len(cluster.Pools), cluster.TotalSets())
+	for _, pool := range cluster.Pools {
+		log.Printf("Pool %d (%s): %d erasure set(s)", pool.PoolIndex, pool.PoolID[:8], pool.SetCount)
+		for setIdx, set := range pool.Sets {
+			available := 0
+			for _, disk := range set {
+				if disk.Path != "" {
+					available++
+				}
 			}
+			log.Printf("  Set %d: %d/%d disks available", setIdx, available, len(set))
 		}
-		log.Printf("  Set %d: %d/%d disks available", setIdx, available, len(set))
 	}
 
 	// Initialize SQLite store
@@ -62,40 +65,43 @@ func main() {
 	}
 	defer store.Close()
 
-	// Sync metadata if requested - sync from one disk per set
+	// Sync metadata if requested - sync from one disk per set per pool
 	if *syncOnStart {
 		log.Println("Syncing metadata from disk...")
 
-		for setIdx, set := range pool.Sets {
-			// Find first available disk in this set
-			var syncDisk string
-			for _, info := range set {
-				if info.Path != "" {
-					syncDisk = info.Path
-					break
+		for _, pool := range cluster.Pools {
+			for setIdx, set := range pool.Sets {
+				// Find first available disk in this set
+				var syncDisk string
+				for _, info := range set {
+					if info.Path != "" {
+						syncDisk = info.Path
+						break
+					}
 				}
+
+				if syncDisk == "" {
+					log.Printf("Warning: no available disks in pool %d set %d, skipping sync", pool.PoolIndex, setIdx)
+					continue
+				}
+
+				syncer := metadata.NewSyncer(store, metadata.SyncConfig{
+					DiskPath:    syncDisk,
+					PoolIndex:   pool.PoolIndex,
+					SetIndex:    setIdx,
+					BatchSize:   1000,
+					ProgressLog: true,
+				})
+
+				result, err := syncer.Sync(ctx)
+				if err != nil {
+					log.Printf("Warning: sync failed for pool %d set %d: %v", pool.PoolIndex, setIdx, err)
+					continue
+				}
+
+				log.Printf("Pool %d Set %d sync complete: %d buckets, %d objects (%d errors) in %v",
+					pool.PoolIndex, setIdx, result.BucketsFound, result.ObjectsSynced, result.Errors, result.Duration)
 			}
-
-			if syncDisk == "" {
-				log.Printf("Warning: no available disks in set %d, skipping sync", setIdx)
-				continue
-			}
-
-			syncer := metadata.NewSyncer(store, metadata.SyncConfig{
-				DiskPath:    syncDisk,
-				SetIndex:    setIdx,
-				BatchSize:   1000,
-				ProgressLog: true,
-			})
-
-			result, err := syncer.Sync(ctx)
-			if err != nil {
-				log.Printf("Warning: sync failed for set %d: %v", setIdx, err)
-				continue
-			}
-
-			log.Printf("Set %d sync complete: %d buckets, %d objects (%d errors) in %v",
-				setIdx, result.BucketsFound, result.ObjectsSynced, result.Errors, result.Duration)
 		}
 	}
 
@@ -107,18 +113,21 @@ func main() {
 		log.Printf("Metadata cache contains %d objects", count)
 	}
 
-	// Create one decoder per set
-	decoders := make([]*erasure.Decoder, pool.SetCount)
-	for setIdx, set := range pool.Sets {
-		diskPaths := make([]string, len(set))
-		for i, info := range set {
-			diskPaths[i] = info.Path
+	// Create decoders for all pools and sets: decoders[poolIndex][setIndex]
+	decoders := make([][]*erasure.Decoder, len(cluster.Pools))
+	for _, pool := range cluster.Pools {
+		decoders[pool.PoolIndex] = make([]*erasure.Decoder, pool.SetCount)
+		for setIdx, set := range pool.Sets {
+			diskPaths := make([]string, len(set))
+			for i, info := range set {
+				diskPaths[i] = info.Path
+			}
+			decoders[pool.PoolIndex][setIdx] = erasure.NewDecoder(diskPaths)
 		}
-		decoders[setIdx] = erasure.NewDecoder(diskPaths)
 	}
 
 	// Create backend
-	be := backend.NewMultiSet(store, decoders)
+	be := backend.NewMultiPool(store, decoders)
 
 	// Create gofakes3 server
 	faker := gofakes3.New(be)

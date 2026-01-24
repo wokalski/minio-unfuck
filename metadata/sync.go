@@ -15,6 +15,7 @@ import (
 // SyncConfig configures the sync process
 type SyncConfig struct {
 	DiskPath    string // Path to a single disk to scan
+	PoolIndex   int    // Which pool this disk belongs to
 	SetIndex    int    // Which erasure set this disk belongs to
 	BatchSize   int    // Number of objects per transaction (default: 1000)
 	ProgressLog bool   // Log progress
@@ -169,6 +170,7 @@ func (s *Syncer) syncBucket(ctx context.Context, bucketName, bucketPath string) 
 			ETag:         xlMeta.ETag,
 			ContentType:  xlMeta.ContentType,
 			UserMeta:     xlMeta.UserMeta,
+			PoolIndex:    s.config.PoolIndex,
 			SetIndex:     s.config.SetIndex,
 			DataDir:      xlMeta.DataDirString(),
 			DataBlocks:   xlMeta.DataBlocks,

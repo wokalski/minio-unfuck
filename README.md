@@ -43,10 +43,12 @@ aws --endpoint-url http://localhost:9000 s3 cp s3://mybucket/myfile.txt ./
 
 ## How it works
 
-1. **Startup**: Reads `format.json` from each disk to discover pool/set configuration
-2. **Sync**: Walks one disk per erasure set, parses `xl.meta` files, caches metadata in SQLite
+1. **Startup**: Reads `format.json` from each disk to discover cluster configuration (multiple pools and erasure sets)
+2. **Sync**: Walks one disk per erasure set per pool, parses `xl.meta` files, caches metadata in SQLite
 3. **LIST/HEAD**: Served from SQLite (fast)
 4. **GET**: Reads 11 data shards in parallel, reconstructs if needed using Reed-Solomon
+
+Supports expanded MinIO installations with multiple pools (added after initial setup).
 
 ## Disk layout expected
 
@@ -69,7 +71,6 @@ The disk directory names don't matter - ordering is determined from `format.json
 - **No versioning**: Only reads latest version
 - **No multipart upload**: But reads existing multipart objects fine
 - **No encryption**: Assumes unencrypted data
-- **Single pool**: Multiple erasure sets supported, multiple pools not yet
 
 ## Migrating off MinIO
 

@@ -18,19 +18,27 @@ import (
 // Backend implements gofakes3.Backend using SQLite for metadata and erasure decoding for data
 type Backend struct {
 	store    *metadata.Store
-	decoders []*erasure.Decoder // One decoder per erasure set
+	decoders [][]*erasure.Decoder // decoders[poolIndex][setIndex]
 }
 
-// New creates a new backend with a single decoder (for single-set configurations)
+// New creates a new backend with a single decoder (for single-pool, single-set configurations)
 func New(store *metadata.Store, decoder *erasure.Decoder) *Backend {
 	return &Backend{
 		store:    store,
-		decoders: []*erasure.Decoder{decoder},
+		decoders: [][]*erasure.Decoder{{decoder}},
 	}
 }
 
-// NewMultiSet creates a new backend with multiple decoders (one per erasure set)
+// NewMultiSet creates a new backend with multiple decoders for a single pool
 func NewMultiSet(store *metadata.Store, decoders []*erasure.Decoder) *Backend {
+	return &Backend{
+		store:    store,
+		decoders: [][]*erasure.Decoder{decoders},
+	}
+}
+
+// NewMultiPool creates a new backend with multiple pools, each with multiple sets
+func NewMultiPool(store *metadata.Store, decoders [][]*erasure.Decoder) *Backend {
 	return &Backend{
 		store:    store,
 		decoders: decoders,
@@ -169,11 +177,15 @@ func (b *Backend) GetObject(bucketName, objectName string, rangeRequest *gofakes
 		})
 	}
 
-	// Select correct decoder based on set index
-	if obj.SetIndex < 0 || obj.SetIndex >= len(b.decoders) {
-		return nil, fmt.Errorf("invalid set index %d (have %d decoders)", obj.SetIndex, len(b.decoders))
+	// Select correct decoder based on pool and set index
+	if obj.PoolIndex < 0 || obj.PoolIndex >= len(b.decoders) {
+		return nil, fmt.Errorf("invalid pool index %d (have %d pools)", obj.PoolIndex, len(b.decoders))
 	}
-	decoder := b.decoders[obj.SetIndex]
+	poolDecoders := b.decoders[obj.PoolIndex]
+	if obj.SetIndex < 0 || obj.SetIndex >= len(poolDecoders) {
+		return nil, fmt.Errorf("invalid set index %d in pool %d (have %d sets)", obj.SetIndex, obj.PoolIndex, len(poolDecoders))
+	}
+	decoder := poolDecoders[obj.SetIndex]
 
 	// Read object data using decoder
 	data, err := decoder.ReadObjectWithMeta(bucketName, objectName, xlMeta)

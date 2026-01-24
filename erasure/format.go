@@ -11,7 +11,7 @@ import (
 type DiskFormat struct {
 	Version string `json:"version"`
 	Format  string `json:"format"`
-	ID      string `json:"id"`
+	ID      string `json:"id"` // Pool ID
 	XL      struct {
 		Version          string     `json:"version"`
 		This             string     `json:"this"`
@@ -22,118 +22,131 @@ type DiskFormat struct {
 
 // DiskInfo contains information about a discovered disk
 type DiskInfo struct {
-	Path       string // Filesystem path to the disk
-	UUID       string // Disk UUID from format.json
-	SetIndex   int    // Which erasure set this disk belongs to
-	DiskIndex  int    // Position within the erasure set (0-based)
-	PoolID     string // Pool ID (same for all disks in a pool)
+	Path      string // Filesystem path to the disk
+	UUID      string // Disk UUID from format.json
+	PoolIndex int    // Which pool (0, 1, ...)
+	SetIndex  int    // Which erasure set within the pool
+	DiskIndex int    // Position within the erasure set (0-based)
+	PoolID    string // Pool UUID
 }
 
 // PoolConfig contains the discovered pool configuration
 type PoolConfig struct {
-	PoolID   string       // Pool UUID
-	Sets     [][]DiskInfo // Disks organized by set
-	SetCount int          // Number of erasure sets
+	PoolID    string       // Pool UUID
+	PoolIndex int          // Index of this pool (0, 1, ...)
+	Sets      [][]DiskInfo // Disks organized by set
+	SetCount  int          // Number of erasure sets
 }
 
-// DiscoverDisks reads format.json from each disk path and returns ordered disk info
-// The returned slice is ordered by logical position in the erasure set
-// DEPRECATED: Use DiscoverPool for multi-set support
-func DiscoverDisks(diskPaths []string) ([]DiskInfo, error) {
-	pool, err := DiscoverPool(diskPaths)
-	if err != nil {
-		return nil, err
-	}
-	// Return first set for backwards compatibility
-	if len(pool.Sets) == 0 {
-		return nil, fmt.Errorf("no sets found")
-	}
-	return pool.Sets[0], nil
+// ClusterConfig contains all discovered pools
+type ClusterConfig struct {
+	Pools []*PoolConfig
 }
 
-// DiscoverPool reads format.json from each disk path and returns full pool configuration
-func DiscoverPool(diskPaths []string) (*PoolConfig, error) {
+// TotalSets returns total number of sets across all pools
+func (c *ClusterConfig) TotalSets() int {
+	total := 0
+	for _, pool := range c.Pools {
+		total += pool.SetCount
+	}
+	return total
+}
+
+// DiscoverCluster reads format.json from all disks and groups them by pool
+func DiscoverCluster(diskPaths []string) (*ClusterConfig, error) {
 	if len(diskPaths) == 0 {
 		return nil, fmt.Errorf("no disk paths provided")
 	}
 
 	// Read format.json from each disk
-	var formats []DiskFormat
-	var validPaths []string
+	type diskData struct {
+		format DiskFormat
+		path   string
+	}
+	var disks []diskData
 
 	for _, path := range diskPaths {
 		formatPath := filepath.Join(path, ".minio.sys", "format.json")
 		data, err := os.ReadFile(formatPath)
 		if err != nil {
-			continue // Skip disks without format.json
+			continue
 		}
 
 		var format DiskFormat
 		if err := json.Unmarshal(data, &format); err != nil {
-			continue // Skip invalid format.json
+			continue
 		}
 
-		formats = append(formats, format)
-		validPaths = append(validPaths, path)
+		disks = append(disks, diskData{format: format, path: path})
 	}
 
-	if len(formats) == 0 {
+	if len(disks) == 0 {
 		return nil, fmt.Errorf("no valid format.json found in any disk")
 	}
 
-	// Use the first format to get the set configuration
-	// All disks should have the same sets array
-	sets := formats[0].XL.Sets
-	if len(sets) == 0 {
-		return nil, fmt.Errorf("no erasure sets found in format.json")
+	// Group disks by pool ID
+	poolDisks := make(map[string][]diskData)
+	poolOrder := []string{} // Preserve discovery order
+
+	for _, d := range disks {
+		poolID := d.format.ID
+		if _, exists := poolDisks[poolID]; !exists {
+			poolOrder = append(poolOrder, poolID)
+		}
+		poolDisks[poolID] = append(poolDisks[poolID], d)
 	}
 
-	// Build UUID to path mapping
-	uuidToPath := make(map[string]string)
-	for i, format := range formats {
-		uuidToPath[format.XL.This] = validPaths[i]
+	// Build cluster config
+	cluster := &ClusterConfig{
+		Pools: make([]*PoolConfig, len(poolOrder)),
 	}
 
-	// Build pool config with all sets
-	pool := &PoolConfig{
-		PoolID:   formats[0].ID,
-		SetCount: len(sets),
-		Sets:     make([][]DiskInfo, len(sets)),
-	}
+	for poolIdx, poolID := range poolOrder {
+		disksInPool := poolDisks[poolID]
 
-	for setIdx, set := range sets {
-		pool.Sets[setIdx] = make([]DiskInfo, len(set))
-		for diskIdx, uuid := range set {
-			path := uuidToPath[uuid] // Empty string if not found
-			pool.Sets[setIdx][diskIdx] = DiskInfo{
-				Path:      path,
-				UUID:      uuid,
-				SetIndex:  setIdx,
-				DiskIndex: diskIdx,
-				PoolID:    formats[0].ID,
+		// Get sets configuration from first disk in pool
+		sets := disksInPool[0].format.XL.Sets
+		if len(sets) == 0 {
+			return nil, fmt.Errorf("pool %s has no erasure sets", poolID)
+		}
+
+		// Build UUID to path mapping for this pool
+		uuidToPath := make(map[string]string)
+		for _, d := range disksInPool {
+			uuidToPath[d.format.XL.This] = d.path
+		}
+
+		// Build pool config
+		pool := &PoolConfig{
+			PoolID:    poolID,
+			PoolIndex: poolIdx,
+			SetCount:  len(sets),
+			Sets:      make([][]DiskInfo, len(sets)),
+		}
+
+		for setIdx, set := range sets {
+			pool.Sets[setIdx] = make([]DiskInfo, len(set))
+			for diskIdx, uuid := range set {
+				path := uuidToPath[uuid]
+				pool.Sets[setIdx][diskIdx] = DiskInfo{
+					Path:      path,
+					UUID:      uuid,
+					PoolIndex: poolIdx,
+					SetIndex:  setIdx,
+					DiskIndex: diskIdx,
+					PoolID:    poolID,
+				}
 			}
 		}
+
+		cluster.Pools[poolIdx] = pool
 	}
 
-	return pool, nil
+	return cluster, nil
 }
 
-// DiscoverDisksInDirectory finds all storage directories in a root directory
-// and discovers their configuration
-// DEPRECATED: Use DiscoverPoolInDirectory for multi-set support
-func DiscoverDisksInDirectory(rootDir string) ([]DiskInfo, error) {
-	pool, err := DiscoverPoolInDirectory(rootDir)
-	if err != nil {
-		return nil, err
-	}
-	if len(pool.Sets) == 0 {
-		return nil, fmt.Errorf("no sets found")
-	}
-	return pool.Sets[0], nil
-}
-
-// DiscoverPoolInDirectory finds all storage directories and returns full pool configuration
-func DiscoverPoolInDirectory(rootDir string) (*PoolConfig, error) {
+// DiscoverClusterInDirectory finds all storage directories and returns cluster configuration
+func DiscoverClusterInDirectory(rootDir string) (*ClusterConfig, error) {
 	entries, err := os.ReadDir(rootDir)
 	if err != nil {
 		return nil, fmt.Errorf("read root directory: %w", err)
@@ -146,7 +159,6 @@ func DiscoverPoolInDirectory(rootDir string) (*PoolConfig, error) {
 		}
 
 		path := filepath.Join(rootDir, entry.Name())
-		// Check if this looks like a MinIO disk (has .minio.sys/format.json)
 		formatPath := filepath.Join(path, ".minio.sys", "format.json")
 		if _, err := os.Stat(formatPath); err == nil {
 			diskPaths = append(diskPaths, path)
@@ -157,10 +169,60 @@ func DiscoverPoolInDirectory(rootDir string) (*PoolConfig, error) {
 		return nil, fmt.Errorf("no MinIO disks found in %s", rootDir)
 	}
 
-	return DiscoverPool(diskPaths)
+	return DiscoverCluster(diskPaths)
 }
 
-// GetOrderedDiskPaths returns disk paths in the correct erasure set order
+// Legacy functions for backwards compatibility
+
+// DiscoverPool returns the first pool only (deprecated, use DiscoverCluster)
+func DiscoverPool(diskPaths []string) (*PoolConfig, error) {
+	cluster, err := DiscoverCluster(diskPaths)
+	if err != nil {
+		return nil, err
+	}
+	if len(cluster.Pools) == 0 {
+		return nil, fmt.Errorf("no pools found")
+	}
+	return cluster.Pools[0], nil
+}
+
+// DiscoverPoolInDirectory returns the first pool only (deprecated)
+func DiscoverPoolInDirectory(rootDir string) (*PoolConfig, error) {
+	cluster, err := DiscoverClusterInDirectory(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(cluster.Pools) == 0 {
+		return nil, fmt.Errorf("no pools found")
+	}
+	return cluster.Pools[0], nil
+}
+
+// DiscoverDisks returns the first set of the first pool (deprecated)
+func DiscoverDisks(diskPaths []string) ([]DiskInfo, error) {
+	pool, err := DiscoverPool(diskPaths)
+	if err != nil {
+		return nil, err
+	}
+	if len(pool.Sets) == 0 {
+		return nil, fmt.Errorf("no sets found")
+	}
+	return pool.Sets[0], nil
+}
+
+// DiscoverDisksInDirectory returns the first set of the first pool (deprecated)
+func DiscoverDisksInDirectory(rootDir string) ([]DiskInfo, error) {
+	pool, err := DiscoverPoolInDirectory(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(pool.Sets) == 0 {
+		return nil, fmt.Errorf("no sets found")
+	}
+	return pool.Sets[0], nil
+}
+
+// GetOrderedDiskPaths returns disk paths from a slice of DiskInfo
 func GetOrderedDiskPaths(diskInfos []DiskInfo) []string {
 	paths := make([]string, len(diskInfos))
 	for i, info := range diskInfos {
