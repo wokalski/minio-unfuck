@@ -4,3 +4,4 @@ new/
 .disks
 .direnv
 .DS_Store
+*.db
