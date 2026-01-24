@@ -29,9 +29,30 @@ type DiskInfo struct {
 	PoolID     string // Pool ID (same for all disks in a pool)
 }
 
+// PoolConfig contains the discovered pool configuration
+type PoolConfig struct {
+	PoolID   string       // Pool UUID
+	Sets     [][]DiskInfo // Disks organized by set
+	SetCount int          // Number of erasure sets
+}
+
 // DiscoverDisks reads format.json from each disk path and returns ordered disk info
 // The returned slice is ordered by logical position in the erasure set
+// DEPRECATED: Use DiscoverPool for multi-set support
 func DiscoverDisks(diskPaths []string) ([]DiskInfo, error) {
+	pool, err := DiscoverPool(diskPaths)
+	if err != nil {
+		return nil, err
+	}
+	// Return first set for backwards compatibility
+	if len(pool.Sets) == 0 {
+		return nil, fmt.Errorf("no sets found")
+	}
+	return pool.Sets[0], nil
+}
+
+// DiscoverPool reads format.json from each disk path and returns full pool configuration
+func DiscoverPool(diskPaths []string) (*PoolConfig, error) {
 	if len(diskPaths) == 0 {
 		return nil, fmt.Errorf("no disk paths provided")
 	}
@@ -67,47 +88,52 @@ func DiscoverDisks(diskPaths []string) ([]DiskInfo, error) {
 		return nil, fmt.Errorf("no erasure sets found in format.json")
 	}
 
-	// For now, assume single set (set 0)
-	// TODO: Support multiple sets if needed
-	set := sets[0]
-
 	// Build UUID to path mapping
 	uuidToPath := make(map[string]string)
 	for i, format := range formats {
 		uuidToPath[format.XL.This] = validPaths[i]
 	}
 
-	// Build ordered disk info based on set order
-	diskInfos := make([]DiskInfo, len(set))
-	for i, uuid := range set {
-		path, ok := uuidToPath[uuid]
-		if !ok {
-			// Disk not found - leave empty, decoder will handle missing disks
-			diskInfos[i] = DiskInfo{
-				Path:      "",
+	// Build pool config with all sets
+	pool := &PoolConfig{
+		PoolID:   formats[0].ID,
+		SetCount: len(sets),
+		Sets:     make([][]DiskInfo, len(sets)),
+	}
+
+	for setIdx, set := range sets {
+		pool.Sets[setIdx] = make([]DiskInfo, len(set))
+		for diskIdx, uuid := range set {
+			path := uuidToPath[uuid] // Empty string if not found
+			pool.Sets[setIdx][diskIdx] = DiskInfo{
+				Path:      path,
 				UUID:      uuid,
-				SetIndex:  0,
-				DiskIndex: i,
+				SetIndex:  setIdx,
+				DiskIndex: diskIdx,
 				PoolID:    formats[0].ID,
 			}
-			continue
-		}
-
-		diskInfos[i] = DiskInfo{
-			Path:      path,
-			UUID:      uuid,
-			SetIndex:  0,
-			DiskIndex: i,
-			PoolID:    formats[0].ID,
 		}
 	}
 
-	return diskInfos, nil
+	return pool, nil
 }
 
 // DiscoverDisksInDirectory finds all storage directories in a root directory
 // and discovers their configuration
+// DEPRECATED: Use DiscoverPoolInDirectory for multi-set support
 func DiscoverDisksInDirectory(rootDir string) ([]DiskInfo, error) {
+	pool, err := DiscoverPoolInDirectory(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(pool.Sets) == 0 {
+		return nil, fmt.Errorf("no sets found")
+	}
+	return pool.Sets[0], nil
+}
+
+// DiscoverPoolInDirectory finds all storage directories and returns full pool configuration
+func DiscoverPoolInDirectory(rootDir string) (*PoolConfig, error) {
 	entries, err := os.ReadDir(rootDir)
 	if err != nil {
 		return nil, fmt.Errorf("read root directory: %w", err)
@@ -131,7 +157,7 @@ func DiscoverDisksInDirectory(rootDir string) ([]DiskInfo, error) {
 		return nil, fmt.Errorf("no MinIO disks found in %s", rootDir)
 	}
 
-	return DiscoverDisks(diskPaths)
+	return DiscoverPool(diskPaths)
 }
 
 // GetOrderedDiskPaths returns disk paths in the correct erasure set order

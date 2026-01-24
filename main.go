@@ -36,15 +36,23 @@ func main() {
 		cancel()
 	}()
 
-	// Discover disks
+	// Discover disks and pool configuration
 	log.Printf("Discovering disks in %s...", *rootDir)
-	diskInfos, err := erasure.DiscoverDisksInDirectory(*rootDir)
+	pool, err := erasure.DiscoverPoolInDirectory(*rootDir)
 	if err != nil {
 		log.Fatalf("Failed to discover disks: %v", err)
 	}
 
-	diskPaths := erasure.GetOrderedDiskPaths(diskInfos)
-	log.Printf("Discovered %d disks in pool %s", len(diskInfos), diskInfos[0].PoolID)
+	log.Printf("Discovered pool %s with %d erasure set(s)", pool.PoolID, pool.SetCount)
+	for setIdx, set := range pool.Sets {
+		available := 0
+		for _, disk := range set {
+			if disk.Path != "" {
+				available++
+			}
+		}
+		log.Printf("  Set %d: %d/%d disks available", setIdx, available, len(set))
+	}
 
 	// Initialize SQLite store
 	log.Printf("Opening metadata database: %s", *dbPath)
@@ -54,36 +62,41 @@ func main() {
 	}
 	defer store.Close()
 
-	// Sync metadata if requested
+	// Sync metadata if requested - sync from one disk per set
 	if *syncOnStart {
 		log.Println("Syncing metadata from disk...")
 
-		// Use first disk for sync (xl.meta is identical on all disks in a set)
-		var syncDisk string
-		for _, info := range diskInfos {
-			if info.Path != "" {
-				syncDisk = info.Path
-				break
+		for setIdx, set := range pool.Sets {
+			// Find first available disk in this set
+			var syncDisk string
+			for _, info := range set {
+				if info.Path != "" {
+					syncDisk = info.Path
+					break
+				}
 			}
+
+			if syncDisk == "" {
+				log.Printf("Warning: no available disks in set %d, skipping sync", setIdx)
+				continue
+			}
+
+			syncer := metadata.NewSyncer(store, metadata.SyncConfig{
+				DiskPath:    syncDisk,
+				SetIndex:    setIdx,
+				BatchSize:   1000,
+				ProgressLog: true,
+			})
+
+			result, err := syncer.Sync(ctx)
+			if err != nil {
+				log.Printf("Warning: sync failed for set %d: %v", setIdx, err)
+				continue
+			}
+
+			log.Printf("Set %d sync complete: %d buckets, %d objects (%d errors) in %v",
+				setIdx, result.BucketsFound, result.ObjectsSynced, result.Errors, result.Duration)
 		}
-
-		if syncDisk == "" {
-			log.Fatal("No available disks found for sync")
-		}
-
-		syncer := metadata.NewSyncer(store, metadata.SyncConfig{
-			DiskPath:    syncDisk,
-			BatchSize:   1000,
-			ProgressLog: true,
-		})
-
-		result, err := syncer.Sync(ctx)
-		if err != nil {
-			log.Fatalf("Sync failed: %v", err)
-		}
-
-		log.Printf("Sync complete: %d buckets, %d objects synced (%d errors) in %v",
-			result.BucketsFound, result.ObjectsSynced, result.Errors, result.Duration)
 	}
 
 	// Count objects in cache
@@ -94,11 +107,18 @@ func main() {
 		log.Printf("Metadata cache contains %d objects", count)
 	}
 
-	// Create decoder
-	decoder := erasure.NewDecoder(diskPaths)
+	// Create one decoder per set
+	decoders := make([]*erasure.Decoder, pool.SetCount)
+	for setIdx, set := range pool.Sets {
+		diskPaths := make([]string, len(set))
+		for i, info := range set {
+			diskPaths[i] = info.Path
+		}
+		decoders[setIdx] = erasure.NewDecoder(diskPaths)
+	}
 
 	// Create backend
-	be := backend.New(store, decoder)
+	be := backend.NewMultiSet(store, decoders)
 
 	// Create gofakes3 server
 	faker := gofakes3.New(be)

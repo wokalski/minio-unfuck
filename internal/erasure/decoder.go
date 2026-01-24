@@ -161,68 +161,90 @@ func (d *Decoder) decodeBlock(bucket, key, dataDir string, partNum int, blockIdx
 	parityBlocks := meta.ParityBlocks
 	totalShards := dataBlocks + parityBlocks
 
-	// Create Reed-Solomon encoder/decoder
-	enc, err := reedsolomon.New(dataBlocks, parityBlocks)
-	if err != nil {
-		return nil, fmt.Errorf("create RS encoder: %w", err)
-	}
-
-	// Read shards in parallel
 	shards := make([][]byte, totalShards)
 	errors := make([]error, totalShards)
-	var wg sync.WaitGroup
 
 	// Build reverse mapping: shardIdx -> diskIdx
 	// Distribution[diskIdx] = erasureIndex (1-based shard number)
-	// So we need to find which diskIdx has Distribution[diskIdx] = shardIdx+1
 	shardToDisk := make(map[int]int)
 	for diskIdx, erasureIdx := range meta.Distribution {
 		shardIdx := erasureIdx - 1 // Convert 1-based to 0-based
 		shardToDisk[shardIdx] = diskIdx
 	}
 
-	for shardIdx := 0; shardIdx < totalShards; shardIdx++ {
+	// Helper to read a shard
+	readShard := func(shardIdx int) {
 		diskIdx, ok := shardToDisk[shardIdx]
 		if !ok {
 			errors[shardIdx] = fmt.Errorf("shard %d: no distribution mapping", shardIdx)
-			continue
+			return
 		}
-
 		if diskIdx < 0 || diskIdx >= len(d.diskPaths) {
 			errors[shardIdx] = fmt.Errorf("shard %d: invalid disk index %d", shardIdx, diskIdx)
-			continue
+			return
 		}
-
-		// Skip if in skip map
+		if d.diskPaths[diskIdx] == "" {
+			errors[shardIdx] = fmt.Errorf("shard %d: disk unavailable", shardIdx)
+			return
+		}
 		if skipMap[diskIdx] {
-			// Leave shard as nil for reconstruction
-			continue
+			errors[shardIdx] = fmt.Errorf("shard %d: skipped", shardIdx)
+			return
 		}
 
-		wg.Add(1)
-		go func(shardIdx, diskIdx int) {
-			defer wg.Done()
-
-			shardPath := ShardPath(d.diskPaths[diskIdx], bucket, key, dataDir, partNum)
-			data, err := ReadShard(shardPath, int(blockIdx), shardSize, true)
-			if err != nil {
-				errors[shardIdx] = err
-				return
-			}
-			shards[shardIdx] = data
-		}(shardIdx, diskIdx)
+		shardPath := ShardPath(d.diskPaths[diskIdx], bucket, key, dataDir, partNum)
+		data, err := ReadShard(shardPath, int(blockIdx), shardSize, true)
+		if err != nil {
+			errors[shardIdx] = err
+			return
+		}
+		shards[shardIdx] = data
 	}
 
+	// Step 1: Read only data shards (first dataBlocks) in parallel
+	var wg sync.WaitGroup
+	for shardIdx := 0; shardIdx < dataBlocks; shardIdx++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			readShard(idx)
+		}(shardIdx)
+	}
 	wg.Wait()
 
-	// Count available shards
+	// Count successful data shards
+	dataSuccess := 0
+	for i := 0; i < dataBlocks; i++ {
+		if shards[i] != nil && len(shards[i]) > 0 {
+			dataSuccess++
+		}
+	}
+
+	// Step 2: If all data shards succeeded, no reconstruction needed
+	if dataSuccess == dataBlocks {
+		// Fast path: just concatenate data shards
+		var blockData []byte
+		for i := 0; i < dataBlocks; i++ {
+			blockData = append(blockData, shards[i]...)
+		}
+		return blockData, nil
+	}
+
+	// Step 3: Need reconstruction - read parity shards
+	for shardIdx := dataBlocks; shardIdx < totalShards; shardIdx++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			readShard(idx)
+		}(shardIdx)
+	}
+	wg.Wait()
+
+	// Count total available shards
 	available := 0
-	for i, shard := range shards {
-		if shard != nil && len(shard) > 0 {
+	for i := 0; i < totalShards; i++ {
+		if shards[i] != nil && len(shards[i]) > 0 {
 			available++
-		} else if errors[i] != nil {
-			// Log error but continue (might be able to reconstruct)
-			_ = errors[i]
 		}
 	}
 
@@ -230,44 +252,37 @@ func (d *Decoder) decodeBlock(bucket, key, dataDir string, partNum int, blockIdx
 		return nil, fmt.Errorf("insufficient shards: have %d, need %d", available, dataBlocks)
 	}
 
-	// Normalize shard sizes (all data shards should be same size)
-	// Find the max shard size
+	// Create Reed-Solomon decoder
+	enc, err := reedsolomon.New(dataBlocks, parityBlocks)
+	if err != nil {
+		return nil, fmt.Errorf("create RS encoder: %w", err)
+	}
+
+	// Normalize shard sizes
 	maxSize := int64(0)
-	for _, shard := range shards[:dataBlocks] {
+	for _, shard := range shards {
 		if shard != nil && int64(len(shard)) > maxSize {
 			maxSize = int64(len(shard))
 		}
 	}
 
-	// Pad shorter shards (for last block which might have smaller shards)
+	// Pad shorter shards and allocate space for missing ones
 	for i := range shards {
-		if shards[i] != nil && int64(len(shards[i])) < maxSize {
+		if shards[i] == nil || len(shards[i]) == 0 {
+			shards[i] = make([]byte, maxSize)
+		} else if int64(len(shards[i])) < maxSize {
 			padded := make([]byte, maxSize)
 			copy(padded, shards[i])
 			shards[i] = padded
 		}
 	}
 
-	// Check if reconstruction is needed
-	needsReconstruction := false
-	for i := 0; i < totalShards; i++ {
-		if shards[i] == nil || len(shards[i]) == 0 {
-			needsReconstruction = true
-			// Allocate space for reconstruction
-			if maxSize > 0 {
-				shards[i] = make([]byte, maxSize)
-			}
-		}
+	// Reconstruct missing data shards
+	if err := enc.ReconstructData(shards); err != nil {
+		return nil, fmt.Errorf("reconstruction failed: %w", err)
 	}
 
-	if needsReconstruction {
-		// Only reconstruct data blocks (we don't need parity)
-		if err := enc.ReconstructData(shards); err != nil {
-			return nil, fmt.Errorf("reconstruction failed: %w", err)
-		}
-	}
-
-	// Concatenate data blocks (first dataBlocks shards)
+	// Concatenate data blocks
 	var blockData []byte
 	for i := 0; i < dataBlocks; i++ {
 		blockData = append(blockData, shards[i]...)

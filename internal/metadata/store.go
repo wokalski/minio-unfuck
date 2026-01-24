@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS objects (
     user_metadata TEXT,  -- JSON
 
     -- Erasure config (for reads)
+    set_index INTEGER NOT NULL DEFAULT 0,  -- Which erasure set
     data_dir TEXT NOT NULL,
     data_blocks INTEGER NOT NULL,
     parity_blocks INTEGER NOT NULL,
@@ -55,6 +56,7 @@ type ObjectMeta struct {
 	UserMeta    map[string]string
 
 	// Erasure config
+	SetIndex     int // Which erasure set this object belongs to
 	DataDir      string
 	DataBlocks   int
 	ParityBlocks int
@@ -170,14 +172,15 @@ func (s *Store) UpsertObject(ctx context.Context, obj *ObjectMeta) error {
 
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO objects (bucket, key, size, mod_time, etag, content_type, user_metadata,
-		                      data_dir, data_blocks, parity_blocks, block_size, distribution, parts)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                      set_index, data_dir, data_blocks, parity_blocks, block_size, distribution, parts)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(bucket, key) DO UPDATE SET
 		     size = excluded.size,
 		     mod_time = excluded.mod_time,
 		     etag = excluded.etag,
 		     content_type = excluded.content_type,
 		     user_metadata = excluded.user_metadata,
+		     set_index = excluded.set_index,
 		     data_dir = excluded.data_dir,
 		     data_blocks = excluded.data_blocks,
 		     parity_blocks = excluded.parity_blocks,
@@ -185,7 +188,7 @@ func (s *Store) UpsertObject(ctx context.Context, obj *ObjectMeta) error {
 		     distribution = excluded.distribution,
 		     parts = excluded.parts`,
 		obj.Bucket, obj.Key, obj.Size, obj.ModTime.UnixNano(), obj.ETag, obj.ContentType, string(userMetaJSON),
-		obj.DataDir, obj.DataBlocks, obj.ParityBlocks, obj.BlockSize, string(distJSON), string(partsJSON))
+		obj.SetIndex, obj.DataDir, obj.DataBlocks, obj.ParityBlocks, obj.BlockSize, string(distJSON), string(partsJSON))
 	return err
 }
 
@@ -198,11 +201,11 @@ func (s *Store) GetObject(ctx context.Context, bucket, key string) (*ObjectMeta,
 
 	err := s.db.QueryRowContext(ctx,
 		`SELECT bucket, key, size, mod_time, etag, content_type, user_metadata,
-		        data_dir, data_blocks, parity_blocks, block_size, distribution, parts
+		        set_index, data_dir, data_blocks, parity_blocks, block_size, distribution, parts
 		 FROM objects WHERE bucket = ? AND key = ?`,
 		bucket, key).Scan(
 		&obj.Bucket, &obj.Key, &obj.Size, &modTime, &obj.ETag, &contentType, &userMetaJSON,
-		&obj.DataDir, &obj.DataBlocks, &obj.ParityBlocks, &obj.BlockSize, &distJSON, &partsJSON)
+		&obj.SetIndex, &obj.DataDir, &obj.DataBlocks, &obj.ParityBlocks, &obj.BlockSize, &distJSON, &partsJSON)
 
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -342,14 +345,15 @@ func (s *Store) UpsertObjectTx(ctx context.Context, tx *sql.Tx, obj *ObjectMeta)
 
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO objects (bucket, key, size, mod_time, etag, content_type, user_metadata,
-		                      data_dir, data_blocks, parity_blocks, block_size, distribution, parts)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		                      set_index, data_dir, data_blocks, parity_blocks, block_size, distribution, parts)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(bucket, key) DO UPDATE SET
 		     size = excluded.size,
 		     mod_time = excluded.mod_time,
 		     etag = excluded.etag,
 		     content_type = excluded.content_type,
 		     user_metadata = excluded.user_metadata,
+		     set_index = excluded.set_index,
 		     data_dir = excluded.data_dir,
 		     data_blocks = excluded.data_blocks,
 		     parity_blocks = excluded.parity_blocks,
@@ -357,6 +361,6 @@ func (s *Store) UpsertObjectTx(ctx context.Context, tx *sql.Tx, obj *ObjectMeta)
 		     distribution = excluded.distribution,
 		     parts = excluded.parts`,
 		obj.Bucket, obj.Key, obj.Size, obj.ModTime.UnixNano(), obj.ETag, obj.ContentType, string(userMetaJSON),
-		obj.DataDir, obj.DataBlocks, obj.ParityBlocks, obj.BlockSize, string(distJSON), string(partsJSON))
+		obj.SetIndex, obj.DataDir, obj.DataBlocks, obj.ParityBlocks, obj.BlockSize, string(distJSON), string(partsJSON))
 	return err
 }

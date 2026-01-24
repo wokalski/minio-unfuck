@@ -17,15 +17,23 @@ import (
 
 // Backend implements gofakes3.Backend using SQLite for metadata and erasure decoding for data
 type Backend struct {
-	store   *metadata.Store
-	decoder *erasure.Decoder
+	store    *metadata.Store
+	decoders []*erasure.Decoder // One decoder per erasure set
 }
 
-// New creates a new backend
+// New creates a new backend with a single decoder (for single-set configurations)
 func New(store *metadata.Store, decoder *erasure.Decoder) *Backend {
 	return &Backend{
-		store:   store,
-		decoder: decoder,
+		store:    store,
+		decoders: []*erasure.Decoder{decoder},
+	}
+}
+
+// NewMultiSet creates a new backend with multiple decoders (one per erasure set)
+func NewMultiSet(store *metadata.Store, decoders []*erasure.Decoder) *Backend {
+	return &Backend{
+		store:    store,
+		decoders: decoders,
 	}
 }
 
@@ -161,8 +169,14 @@ func (b *Backend) GetObject(bucketName, objectName string, rangeRequest *gofakes
 		})
 	}
 
+	// Select correct decoder based on set index
+	if obj.SetIndex < 0 || obj.SetIndex >= len(b.decoders) {
+		return nil, fmt.Errorf("invalid set index %d (have %d decoders)", obj.SetIndex, len(b.decoders))
+	}
+	decoder := b.decoders[obj.SetIndex]
+
 	// Read object data using decoder
-	data, err := b.decoder.ReadObjectWithMeta(bucketName, objectName, xlMeta)
+	data, err := decoder.ReadObjectWithMeta(bucketName, objectName, xlMeta)
 	if err != nil {
 		return nil, fmt.Errorf("decode object: %w", err)
 	}
