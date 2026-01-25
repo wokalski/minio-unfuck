@@ -3,11 +3,16 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/johannesboyne/gofakes3"
 
@@ -16,13 +21,55 @@ import (
 	"github.com/wokalski/minio-unfuck/metadata"
 )
 
+// stringSlice is a flag type that collects multiple string values
+type stringSlice []string
+
+func (s *stringSlice) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *stringSlice) Set(value string) error {
+	*s = append(*s, value)
+	return nil
+}
+
 func main() {
-	// Flags
-	rootDir := flag.String("root", ".disks", "Root directory containing disk folders")
-	dbPath := flag.String("db", "metadata.db", "Path to SQLite database")
+	// Common flags
+	dbPath := flag.String("db", "metadata.db", "Path to metadata database")
 	listenAddr := flag.String("addr", ":9000", "Address to listen on")
 	syncOnStart := flag.Bool("sync", true, "Sync metadata on startup")
+
+	// Directory mode flags (existing)
+	rootDir := flag.String("root", "", "Root directory containing disk folders (directory mode)")
+
+	// Raw disk mode flags (new)
+	var diskPaths stringSlice
+	flag.Var(&diskPaths, "disk", "Raw disk path (e.g., /dev/sde). Can be specified multiple times.")
+
+	// Test mode flag
+	testCount := flag.Int("test", 0, "Run validation test on N random objects (requires prior sync)")
+	quickTest := flag.Bool("quicktest", false, "Quick test: just list files from first partition and exit")
+	skipPartitions := flag.Int("skip", 0, "Skip first N partitions (for testing cache effects)")
+
+	// Sync options
+	workers := flag.Int("workers", 4, "Number of parallel workers for sync")
+	batchSize := flag.Int("batch", 10000, "Batch size for bulk inserts")
+
 	flag.Parse()
+
+	// Determine mode
+	diskMode := len(diskPaths) > 0
+	dirMode := *rootDir != ""
+
+	if diskMode && dirMode {
+		log.Fatal("Cannot specify both -disk and -root. Choose one mode.")
+	}
+
+	if !diskMode && !dirMode {
+		// Default to directory mode with default path
+		*rootDir = ".disks"
+		dirMode = true
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -36,9 +83,180 @@ func main() {
 		cancel()
 	}()
 
+	if diskMode {
+		runDiskMode(ctx, diskPaths, *dbPath, *listenAddr, *syncOnStart, *testCount, *workers, *batchSize, *quickTest)
+	} else {
+		runDirectoryMode(ctx, *rootDir, *dbPath, *listenAddr, *syncOnStart)
+	}
+}
+
+// runDiskMode runs in raw disk mode (XFS direct access) with fast sync pipeline
+func runDiskMode(ctx context.Context, diskPaths []string, dbPath, listenAddr string, syncOnStart bool, testCount, workers, batchSize int, quickTest bool) {
+	log.Printf("Running in raw disk mode with disks: %v", diskPaths)
+
+	// Quick test mode: go through ALL partitions, ALL buckets, count everything (no DB)
+	if quickTest {
+		log.Println("Quick test mode: scanning ALL partitions sequentially (no DB)...")
+
+		var allPartitions []string
+		for _, diskPath := range diskPaths {
+			partitions, err := erasure.DiscoverPartitions(diskPath)
+			if err != nil {
+				log.Fatalf("Failed to discover partitions on %s: %v", diskPath, err)
+			}
+			allPartitions = append(allPartitions, partitions...)
+		}
+		log.Printf("Found %d total partitions", len(allPartitions))
+
+		// Skip partitions if requested (for testing cache effects)
+		skip := *skipPartitions
+		if skip > 0 && skip < len(allPartitions) {
+			log.Printf("Skipping first %d partitions", skip)
+			allPartitions = allPartitions[skip:]
+		}
+
+		totalStart := time.Now()
+		var totalKeys int64
+
+		for partIdx, partPath := range allPartitions {
+			partStart := time.Now()
+
+			rawFS, err := erasure.OpenRawFS(partPath)
+			if err != nil {
+				log.Printf("[Part %d] Failed to open %s: %v", partIdx+1, partPath, err)
+				continue
+			}
+
+			// List buckets
+			buckets, err := fs.ReadDir(rawFS.FS(), ".")
+			if err != nil {
+				log.Printf("[Part %d] Failed to read root: %v", partIdx+1, err)
+				rawFS.Close()
+				continue
+			}
+
+			var partKeys int64
+			for _, bucket := range buckets {
+				if !bucket.IsDir() || bucket.Name()[0] == '.' {
+					continue
+				}
+
+				// Count keys in this bucket
+				keys, err := fs.ReadDir(rawFS.FS(), bucket.Name())
+				if err != nil {
+					continue
+				}
+
+				for _, k := range keys {
+					if k.IsDir() {
+						partKeys++
+					}
+				}
+			}
+
+			totalKeys += partKeys
+			rawFS.Close()
+			log.Printf("[Partition %d/%d] %d keys in %v", partIdx+1, len(allPartitions), partKeys, time.Since(partStart))
+
+			// Force GC to free Entry slices before next partition
+			runtime.GC()
+		}
+
+		log.Printf("\nQuick test complete: %d total keys across %d partitions in %v",
+			totalKeys, len(allPartitions), time.Since(totalStart))
+		log.Printf("Speed: %.0f keys/sec", float64(totalKeys)/time.Since(totalStart).Seconds())
+		return
+	}
+
+	// Create fast syncer
+	syncer, err := metadata.NewFastSyncer(metadata.FastSyncConfig{
+		DiskPaths:    diskPaths,
+		DBPath:       dbPath,
+		BatchSize:    batchSize,
+		ShowProgress: true,
+	})
+	if err != nil {
+		log.Fatalf("Failed to create syncer: %v", err)
+	}
+	defer syncer.Close()
+
+	// Fast directory scan (no xl.meta parsing)
+	if syncOnStart {
+		log.Println("Starting fast directory scan...")
+		stats, err := syncer.Sync(ctx)
+		if err != nil {
+			log.Fatalf("Sync failed: %v", err)
+		}
+
+		log.Printf("Fast scan complete in %v:", stats.Duration)
+		log.Printf("  Partitions: %d", stats.PartitionsFound)
+		log.Printf("  Buckets: %d", stats.BucketsFound)
+		log.Printf("  Objects: %d", stats.ObjectsFound)
+		if len(stats.Errors) > 0 {
+			log.Printf("  Errors: %d", len(stats.Errors))
+			for _, e := range stats.Errors {
+				log.Printf("    - %v", e)
+			}
+		}
+	}
+
+	// Get references for backend
+	store := syncer.Store()
+	partitions := syncer.Partitions()
+	diskMap := syncer.DiskMapping()
+
+	// Get object count
+	count, err := store.ObjectCount(ctx)
+	if err != nil {
+		log.Printf("Warning: failed to count objects: %v", err)
+	} else {
+		log.Printf("Metadata cache contains %d objects", count)
+	}
+
+	// Start background xl.meta parser
+	bgParser := metadata.NewBackgroundParser(store, partitions, diskMap, metadata.BackgroundParserConfig{
+		Workers:      workers,
+		BatchSize:    1000,
+		ShowProgress: true,
+	})
+	if err := bgParser.Start(ctx); err != nil {
+		log.Printf("Warning: failed to start background parser: %v", err)
+	}
+	defer bgParser.Stop()
+
+	// Create backend
+	be := backend.NewRawBackend(store, partitions, diskMap)
+
+	// Create gofakes3 server
+	faker := gofakes3.New(be)
+
+	log.Printf("Starting S3 server on %s", listenAddr)
+	log.Println("Note: xl.meta parsing running in background. First GETs may be slower.")
+	log.Println("Example usage:")
+	log.Printf("  aws --endpoint-url http://localhost%s s3 ls", listenAddr)
+	log.Printf("  aws --endpoint-url http://localhost%s s3 ls s3://BUCKET/", listenAddr)
+	log.Printf("  aws --endpoint-url http://localhost%s s3 cp s3://BUCKET/file.txt ./", listenAddr)
+
+	server := &http.Server{
+		Addr:    listenAddr,
+		Handler: faker.Server(),
+	}
+
+	go func() {
+		<-ctx.Done()
+		server.Shutdown(context.Background())
+	}()
+
+	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatal("Server error:", err)
+	}
+}
+
+// runDirectoryMode runs in traditional directory mode (mounted filesystems)
+func runDirectoryMode(ctx context.Context, rootDir, dbPath, listenAddr string, syncOnStart bool) {
 	// Discover disks and cluster configuration
-	log.Printf("Discovering disks in %s...", *rootDir)
-	cluster, err := erasure.DiscoverClusterInDirectory(*rootDir)
+	log.Printf("Discovering disks in %s...", rootDir)
+	cluster, err := erasure.DiscoverClusterInDirectory(rootDir)
 	if err != nil {
 		log.Fatalf("Failed to discover disks: %v", err)
 	}
@@ -58,15 +276,15 @@ func main() {
 	}
 
 	// Initialize SQLite store
-	log.Printf("Opening metadata database: %s", *dbPath)
-	store, err := metadata.NewStore(*dbPath)
+	log.Printf("Opening metadata database: %s", dbPath)
+	store, err := metadata.NewStore(dbPath)
 	if err != nil {
 		log.Fatalf("Failed to open metadata store: %v", err)
 	}
 	defer store.Close()
 
 	// Sync metadata if requested - sync from one disk per set per pool
-	if *syncOnStart {
+	if syncOnStart {
 		log.Println("Syncing metadata from disk...")
 
 		for _, pool := range cluster.Pools {
@@ -132,14 +350,14 @@ func main() {
 	// Create gofakes3 server
 	faker := gofakes3.New(be)
 
-	log.Printf("Starting S3 server on %s", *listenAddr)
+	log.Printf("Starting S3 server on %s", listenAddr)
 	log.Println("Example usage:")
-	log.Printf("  aws --endpoint-url http://localhost%s s3 ls", *listenAddr)
-	log.Printf("  aws --endpoint-url http://localhost%s s3 ls s3://BUCKET/", *listenAddr)
-	log.Printf("  aws --endpoint-url http://localhost%s s3 cp s3://BUCKET/file.txt ./", *listenAddr)
+	log.Printf("  aws --endpoint-url http://localhost%s s3 ls", listenAddr)
+	log.Printf("  aws --endpoint-url http://localhost%s s3 ls s3://BUCKET/", listenAddr)
+	log.Printf("  aws --endpoint-url http://localhost%s s3 cp s3://BUCKET/file.txt ./", listenAddr)
 
 	server := &http.Server{
-		Addr:    *listenAddr,
+		Addr:    listenAddr,
 		Handler: faker.Server(),
 	}
 
@@ -150,5 +368,19 @@ func main() {
 
 	if err := server.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatal("Server error:", err)
+	}
+}
+
+func init() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "MinIO Unfuck - Read-only S3 server for MinIO erasure-coded data\n\n")
+		fmt.Fprintf(os.Stderr, "Modes:\n")
+		fmt.Fprintf(os.Stderr, "  Directory mode (default): Use mounted disk directories\n")
+		fmt.Fprintf(os.Stderr, "    %s -root /path/to/disks\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  Raw disk mode: Read directly from block devices (XFS only)\n")
+		fmt.Fprintf(os.Stderr, "    %s -disk /dev/sde -disk /dev/sdf\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
 	}
 }

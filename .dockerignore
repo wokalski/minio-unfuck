@@ -1,0 +1,9 @@
+.git
+.disks
+.direnv
+.claude
+*.db
+*.wav
+**/*.xfs
+**/testdata/
+vendor_fork/xfs/docs/

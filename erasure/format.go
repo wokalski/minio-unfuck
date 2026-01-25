@@ -3,6 +3,7 @@ package erasure
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -229,4 +230,78 @@ func GetOrderedDiskPaths(diskInfos []DiskInfo) []string {
 		paths[i] = info.Path
 	}
 	return paths
+}
+
+// DiskMapping maps disk UUIDs to partition indices for raw disk access
+type DiskMapping struct {
+	UUIDToPartition map[string]int // disk UUID -> partition index
+	PartitionToUUID map[int]string // partition index -> disk UUID
+	DiskOrder       []string       // ordered list of disk UUIDs from format.json
+	PoolID          string         // pool ID
+}
+
+// GetPartitionForDiskIndex returns the partition index for a given disk index in the distribution
+func (dm *DiskMapping) GetPartitionForDiskIndex(diskIndex int) (int, bool) {
+	if diskIndex < 0 || diskIndex >= len(dm.DiskOrder) {
+		return 0, false
+	}
+	uuid := dm.DiskOrder[diskIndex]
+	partIdx, ok := dm.UUIDToPartition[uuid]
+	return partIdx, ok
+}
+
+// BuildDiskMappingFromRaw reads format.json from raw partitions and builds the disk mapping
+func BuildDiskMappingFromRaw(partitions []*RawFS) (*DiskMapping, error) {
+	if len(partitions) == 0 {
+		return nil, fmt.Errorf("no partitions provided")
+	}
+
+	dm := &DiskMapping{
+		UUIDToPartition: make(map[string]int),
+		PartitionToUUID: make(map[int]string),
+	}
+
+	// Read format.json from each partition
+	for partIdx, part := range partitions {
+		if part == nil {
+			continue // Skip failed partitions
+		}
+		format, err := readFormatFromFS(part.FS())
+		if err != nil {
+			// Skip partitions without format.json
+			continue
+		}
+
+		// Store this partition's UUID
+		diskUUID := format.XL.This
+		dm.UUIDToPartition[diskUUID] = partIdx
+		dm.PartitionToUUID[partIdx] = diskUUID
+
+		// Use the first partition's format.json to get the disk order
+		if dm.DiskOrder == nil && len(format.XL.Sets) > 0 {
+			dm.DiskOrder = format.XL.Sets[0]
+			dm.PoolID = format.ID
+		}
+	}
+
+	if dm.DiskOrder == nil {
+		return nil, fmt.Errorf("no valid format.json found in any partition")
+	}
+
+	return dm, nil
+}
+
+// readFormatFromFS reads format.json from an fs.FS
+func readFormatFromFS(fsys fs.FS) (*DiskFormat, error) {
+	f, err := fsys.Open(".minio.sys/format.json")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var format DiskFormat
+	if err := json.NewDecoder(f).Decode(&format); err != nil {
+		return nil, err
+	}
+	return &format, nil
 }

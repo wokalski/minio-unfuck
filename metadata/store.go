@@ -56,10 +56,14 @@ type ObjectMeta struct {
 	ContentType string
 	UserMeta    map[string]string
 
-	// Erasure config
+	// Location info (always set from fast scan)
+	PartitionIndex int  // Which partition we found this on
+	DataDir        string
+	MetadataLoaded bool // Whether xl.meta has been parsed
+
+	// Erasure config (set after xl.meta parsing)
 	PoolIndex    int // Which pool this object belongs to
 	SetIndex     int // Which erasure set within the pool
-	DataDir      string
 	DataBlocks   int
 	ParityBlocks int
 	BlockSize    int64
