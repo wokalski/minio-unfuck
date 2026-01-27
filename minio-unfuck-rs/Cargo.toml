@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mfu-core",
+    "crates/meta-reader",
+    "crates/s3-server",
+    "crates/dbcat",
+]
+
+[workspace.dependencies]
+# Core
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+# msgpack
+rmp = "0.8"
+
+# Database
+duckdb = { version = "1.2" }
+
+# Erasure coding
+reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
+
+# Hashing
+highway = "1"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# XFS scanning
+fxfsp = { git = "https://github.com/dialohq/fxfsp" }
+
+# Async / IO
+tokio = { version = "1", features = ["full"] }
+
+# S3
+s3s = "0.11"
+s3s-aws = "0.11"
+
+# HTTP
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Progress
+indicatif = "0.17"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# IO (Linux)
+io-uring = "0.7"
+nix = { version = "0.29", features = ["fs", "ioctl"] }

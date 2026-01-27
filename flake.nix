@@ -17,7 +17,12 @@
           # derivation
         };
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [go gopls delve];
+          packages = with pkgs; [
+            go gopls delve
+            pkgs.cargo pkgs.rustc pkgs.rustfmt pkgs.rust-analyzer
+            pkgs.duckdb
+            pkgs.pkg-config
+          ];
         };
       }
     );
