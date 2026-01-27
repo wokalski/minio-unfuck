@@ -189,7 +189,7 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
     db.begin_batch()?;
 
     fxfsp::scan_reader(&mut reader, |event| {
-        let result: Result<()> = (|| {
+        let result: Result<ControlFlow<()>> = (|| {
             match event {
                 FsEvent::Superblock {
                     block_size: bs, ..
@@ -209,9 +209,10 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
                     extents,
                     ..
                 } => {
-                    // Check AG limit
+                    // AGs are scanned sequentially — once we see one past the
+                    // limit we can stop the entire scan.
                     if max_ags > 0 && *ag_number >= max_ags {
-                        return Ok(());
+                        return Ok(ControlFlow::Break(()));
                     }
 
                     db.insert_inode(
@@ -254,7 +255,6 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
                     }
                 }
                 FsEvent::FileExtents { ino, extents } => {
-                    // Btree-format regular file extents (phase 1.5)
                     for ext in extents {
                         let phys_offset = ext.start_block * block_size as u64;
                         let logical_offset = ext.logical_offset * block_size as u64;
@@ -287,16 +287,16 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
                     }
                 }
             }
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         })();
 
-        if let Err(e) = result {
-            warn!("scan event error: {}", e);
+        match result {
+            Ok(cf) => cf,
+            Err(e) => {
+                warn!("scan event error: {}", e);
+                ControlFlow::Continue(())
+            }
         }
-
-        // Stop if we've passed the AG limit (checked in InodeFound, but
-        // we also check here for DirEntry events from later AGs)
-        ControlFlow::Continue(())
     })
     .map_err(|e| anyhow::anyhow!("fxfsp scan: {:?}", e))?;
 
