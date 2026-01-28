@@ -82,6 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_objects_bucket ON objects(bucket);
 /// DuckDB metadata store
 pub struct MetadataDb {
     conn: Connection,
+    path: String,
 }
 
 impl MetadataDb {
@@ -89,29 +90,24 @@ impl MetadataDb {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).context("open duckdb")?;
         conn.execute_batch(SCHEMA).context("create schema")?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: path.to_string() })
     }
 
     /// Open an in-memory DuckDB for testing.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("open in-memory duckdb")?;
         conn.execute_batch(SCHEMA).context("create schema")?;
-        Ok(Self { conn })
+        Ok(Self { conn, path: ":memory:".to_string() })
+    }
+
+    /// Get the database file path.
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     /// Get a reference to the underlying connection
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    // --- Bulk insert via Appender API (for meta-reader) ---
-
-    /// Create a BulkInserter for high-throughput writes during scanning.
-    pub fn bulk_inserter(&self) -> Result<BulkInserter<'_>> {
-        let inodes = self.conn.appender("inodes").context("appender for inodes")?;
-        let dirs = self.conn.appender("dirs").context("appender for dirs")?;
-        let extents = self.conn.appender("file_extents").context("appender for file_extents")?;
-        Ok(BulkInserter { inodes, dirs, extents })
     }
 
     /// Insert a parsed object from xl.meta (uses regular INSERT for OR REPLACE semantics)
@@ -441,13 +437,45 @@ impl MetadataDb {
 
 /// High-throughput bulk inserter using DuckDB's Appender API.
 /// Bypasses SQL parsing entirely — orders of magnitude faster than individual INSERTs.
-pub struct BulkInserter<'conn> {
+/// Owns its own Connection so it can be Send + moved to a writer thread.
+pub struct BulkInserter {
+    conn: Connection,
+}
+
+// Safety: BulkInserter owns its Connection exclusively and is only used from one thread.
+unsafe impl Send for BulkInserter {}
+
+impl BulkInserter {
+    /// Open a new connection to the same database for bulk writing.
+    pub fn open(db_path: &str) -> Result<Self> {
+        let conn = Connection::open(db_path).context("open bulk inserter connection")?;
+        Ok(Self { conn })
+    }
+
+    /// Run a bulk write session. Creates appenders, calls the provided function,
+    /// then flushes and drops the appenders.
+    pub fn write_session<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut WriteSession<'_>) -> Result<()>,
+    {
+        let inodes = self.conn.appender("inodes").context("appender for inodes")?;
+        let dirs = self.conn.appender("dirs").context("appender for dirs")?;
+        let extents = self.conn.appender("file_extents").context("appender for file_extents")?;
+        let mut session = WriteSession { inodes, dirs, extents };
+        f(&mut session)?;
+        session.flush()?;
+        Ok(())
+    }
+}
+
+/// Active write session with open appenders. Cannot outlive the BulkInserter.
+pub struct WriteSession<'conn> {
     inodes: Appender<'conn>,
     dirs: Appender<'conn>,
     extents: Appender<'conn>,
 }
 
-impl<'conn> BulkInserter<'conn> {
+impl<'conn> WriteSession<'conn> {
     pub fn append_inode(
         &mut self,
         device_id: i32,
@@ -495,7 +523,6 @@ impl<'conn> BulkInserter<'conn> {
         Ok(())
     }
 
-    /// Flush all appenders. Called automatically on drop, but explicit flush lets you catch errors.
     pub fn flush(&mut self) -> Result<()> {
         self.inodes.flush()?;
         self.dirs.flush()?;

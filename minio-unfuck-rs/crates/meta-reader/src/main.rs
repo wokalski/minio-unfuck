@@ -4,6 +4,8 @@
 //! inodes, directory entries, file extents, cluster topology, and parsed xl.meta objects.
 
 use std::ops::ControlFlow;
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -11,7 +13,7 @@ use fxfsp::{FsEvent, IoEngine, MaybeInstrumented};
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
-use mfu_core::db::MetadataDb;
+use mfu_core::db::{BulkInserter, MetadataDb};
 use mfu_core::format;
 use mfu_core::raw_io::{self, BatchReadRequest, DeviceReader, PreadDeviceReader};
 use mfu_core::xlmeta;
@@ -33,6 +35,36 @@ struct Args {
     /// Stop scanning after the first N allocation groups per device (0 = all)
     #[arg(long, default_value = "0")]
     max_ags: u32,
+}
+
+/// Owned scan event sent from the scan thread to the writer thread.
+enum ScanEvent {
+    Inode {
+        device_id: i32,
+        ino: i64,
+        mode: i32,
+        size: i64,
+        nlink: i32,
+        uid: i32,
+        gid: i32,
+        mtime_sec: i64,
+        nblocks: i64,
+        ag_number: i32,
+    },
+    Extent {
+        device_id: i32,
+        ino: i64,
+        logical_offset: i64,
+        physical_offset: i64,
+        length: i64,
+    },
+    Dir {
+        device_id: i32,
+        parent_ino: i64,
+        child_ino: i64,
+        name: String,
+        file_type: i32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -177,127 +209,181 @@ fn main() -> Result<()> {
 }
 
 /// Scan a single XFS device using fxfsp, populating inodes/dirs/file_extents in DuckDB.
+///
+/// Uses a channel to decouple the I/O-bound fxfsp scan from DB writes:
+/// - Scan thread: pushes owned ScanEvent variants into a channel (just a memcpy)
+/// - Writer thread: drains the channel into DuckDB via Appender API
 fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32) -> Result<()> {
+    let (tx, rx) = mpsc::sync_channel::<ScanEvent>(64 * 1024);
+
+    // Writer thread: opens its own connection, drains channel via Appender API
+    let db_path = db.path().to_string();
+    let writer = thread::spawn(move || -> Result<(u64, u64, u64)> {
+        let bulk = BulkInserter::open(&db_path)?;
+        let mut inodes = 0u64;
+        let mut dirs = 0u64;
+        let mut extents = 0u64;
+
+        bulk.write_session(|session| {
+            for event in &rx {
+                match event {
+                    ScanEvent::Inode {
+                        device_id,
+                        ino,
+                        mode,
+                        size,
+                        nlink,
+                        uid,
+                        gid,
+                        mtime_sec,
+                        nblocks,
+                        ag_number,
+                    } => {
+                        session.append_inode(
+                            device_id, ino, mode, size, nlink, uid, gid, mtime_sec, nblocks,
+                            ag_number,
+                        )?;
+                        inodes += 1;
+                        if inodes % 100_000 == 0 {
+                            info!("  {} inodes written...", inodes);
+                        }
+                    }
+                    ScanEvent::Extent {
+                        device_id,
+                        ino,
+                        logical_offset,
+                        physical_offset,
+                        length,
+                    } => {
+                        session.append_extent(
+                            device_id, ino, logical_offset, physical_offset, length,
+                        )?;
+                        extents += 1;
+                    }
+                    ScanEvent::Dir {
+                        device_id,
+                        parent_ino,
+                        child_ino,
+                        name,
+                        file_type,
+                    } => {
+                        session.append_dir(device_id, parent_ino, child_ino, &name, file_type)?;
+                        dirs += 1;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok((inodes, dirs, extents))
+    });
+
+    // Scan thread: fxfsp callback just pushes into channel
     let engine = IoEngine::open(device_path, 256 * 1024, 2 * 1024 * 1024)
         .map_err(|e| anyhow::anyhow!("open device: {:?}", e))?;
-    let mut reader = MaybeInstrumented::from_env(engine)
+    let mut fxfsp_reader = MaybeInstrumented::from_env(engine)
         .map_err(|e| anyhow::anyhow!("instrument reader: {:?}", e))?;
 
     let mut block_size: u32 = 0;
-    let mut count = 0u64;
 
-    let mut bulk = db.bulk_inserter()?;
-
-    fxfsp::scan_reader(&mut reader, |event| {
-        let result: Result<ControlFlow<()>> = (|| {
-            match event {
-                FsEvent::Superblock {
-                    block_size: bs, ..
-                } => {
-                    block_size = *bs;
+    fxfsp::scan_reader(&mut fxfsp_reader, |event| {
+        match event {
+            FsEvent::Superblock {
+                block_size: bs, ..
+            } => {
+                block_size = *bs;
+            }
+            FsEvent::InodeFound {
+                ag_number,
+                ino,
+                mode,
+                size,
+                uid,
+                gid,
+                nlink,
+                mtime_sec,
+                nblocks,
+                extents,
+                ..
+            } => {
+                if max_ags > 0 && *ag_number >= max_ags {
+                    return ControlFlow::Break(());
                 }
-                FsEvent::InodeFound {
-                    ag_number,
-                    ino,
-                    mode,
-                    size,
-                    uid,
-                    gid,
-                    nlink,
-                    mtime_sec,
-                    nblocks,
-                    extents,
-                    ..
-                } => {
-                    // AGs are scanned sequentially — once we see one past the
-                    // limit we can stop the entire scan.
-                    if max_ags > 0 && *ag_number >= max_ags {
-                        return Ok(ControlFlow::Break(()));
-                    }
 
-                    bulk.append_inode(
-                        device_id,
-                        *ino as i64,
-                        *mode as i32,
-                        *size as i64,
-                        *nlink as i32,
-                        *uid as i32,
-                        *gid as i32,
-                        *mtime_sec as i64,
-                        *nblocks as i64,
-                        *ag_number as i32,
-                    )?;
+                let _ = tx.send(ScanEvent::Inode {
+                    device_id,
+                    ino: *ino as i64,
+                    mode: *mode as i32,
+                    size: *size as i64,
+                    nlink: *nlink as i32,
+                    uid: *uid as i32,
+                    gid: *gid as i32,
+                    mtime_sec: *mtime_sec as i64,
+                    nblocks: *nblocks as i64,
+                    ag_number: *ag_number as i32,
+                });
 
-                    // Insert inline extents if present (FMT_EXTENTS regular files)
-                    if let Some(exts) = extents {
-                        for ext in exts {
-                            let phys_offset = ext.start_block * block_size as u64;
-                            let logical_offset = ext.logical_offset * block_size as u64;
-                            let length = ext.block_count * block_size as u64;
-                            bulk.append_extent(
-                                device_id,
-                                *ino as i64,
-                                logical_offset as i64,
-                                phys_offset as i64,
-                                length as i64,
-                            )?;
-                        }
-                    }
-
-                    count += 1;
-                    if count % 100_000 == 0 {
-                        info!("  {} inodes processed...", count);
-                    }
-                }
-                FsEvent::FileExtents { ino, extents } => {
-                    for ext in extents {
+                if let Some(exts) = extents {
+                    for ext in exts {
                         let phys_offset = ext.start_block * block_size as u64;
                         let logical_offset = ext.logical_offset * block_size as u64;
                         let length = ext.block_count * block_size as u64;
-                        bulk.append_extent(
+                        let _ = tx.send(ScanEvent::Extent {
                             device_id,
-                            *ino as i64,
-                            logical_offset as i64,
-                            phys_offset as i64,
-                            length as i64,
-                        )?;
-                    }
-                }
-                FsEvent::DirEntry {
-                    parent_ino,
-                    child_ino,
-                    name,
-                    file_type,
-                } => {
-                    // Skip "." and ".."
-                    if *name != b"." && *name != b".." {
-                        let name_str = String::from_utf8_lossy(name);
-                        bulk.append_dir(
-                            device_id,
-                            *parent_ino as i64,
-                            *child_ino as i64,
-                            &name_str,
-                            *file_type as i32,
-                        )?;
+                            ino: *ino as i64,
+                            logical_offset: logical_offset as i64,
+                            physical_offset: phys_offset as i64,
+                            length: length as i64,
+                        });
                     }
                 }
             }
-            Ok(ControlFlow::Continue(()))
-        })();
-
-        match result {
-            Ok(cf) => cf,
-            Err(e) => {
-                warn!("scan event error: {}", e);
-                ControlFlow::Continue(())
+            FsEvent::FileExtents { ino, extents } => {
+                for ext in extents {
+                    let phys_offset = ext.start_block * block_size as u64;
+                    let logical_offset = ext.logical_offset * block_size as u64;
+                    let length = ext.block_count * block_size as u64;
+                    let _ = tx.send(ScanEvent::Extent {
+                        device_id,
+                        ino: *ino as i64,
+                        logical_offset: logical_offset as i64,
+                        physical_offset: phys_offset as i64,
+                        length: length as i64,
+                    });
+                }
+            }
+            FsEvent::DirEntry {
+                parent_ino,
+                child_ino,
+                name,
+                file_type,
+            } => {
+                if *name != b"." && *name != b".." {
+                    let _ = tx.send(ScanEvent::Dir {
+                        device_id,
+                        parent_ino: *parent_ino as i64,
+                        child_ino: *child_ino as i64,
+                        name: String::from_utf8_lossy(name).into_owned(),
+                        file_type: *file_type as i32,
+                    });
+                }
             }
         }
+        ControlFlow::Continue(())
     })
     .map_err(|e| anyhow::anyhow!("fxfsp scan: {:?}", e))?;
 
-    bulk.flush()?;
-    drop(bulk);
-    info!("Device {}: {} inodes scanned", device_id, count);
+    // Signal writer to finish
+    drop(tx);
+
+    // Wait for writer and get stats
+    let (inodes, dirs, extents) = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
+    info!(
+        "Device {}: {} inodes, {} dirs, {} extents",
+        device_id, inodes, dirs, extents
+    );
 
     Ok(())
 }
