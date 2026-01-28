@@ -388,10 +388,10 @@ async fn clickhouse_writer(
             }
         }
 
-        if total_events % 1_000_000 == 0 {
+        if total_events % 100_000 == 0 {
             info!(
-                "  progress: {} total events ({} inodes, {} dirs, {} extents)",
-                total_events, inode_count, dir_count, extent_count
+                "  {}k events | {} inodes, {} dirs, {} extents",
+                total_events / 1_000, inode_count, dir_count, extent_count
             );
         }
     }
