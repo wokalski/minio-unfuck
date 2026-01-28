@@ -15,8 +15,6 @@ use fxfsp::{FsEvent, IoEngine, MaybeInstrumented};
 use serde::Serialize;
 use tracing::{info, Level};
 
-const BATCH_SIZE: usize = 100_000;
-
 #[derive(Parser, Debug)]
 #[command(
     name = "meta-reader",
@@ -293,11 +291,9 @@ fn scan_device(
     Ok(())
 }
 
-/// ClickHouse writer: drains the channel, batches rows, and inserts via HTTP.
+/// ClickHouse writer: drains the channel, pushes rows directly.
 ///
-/// Accumulates rows into per-table Vec buffers. When any buffer hits BATCH_SIZE,
-/// it's flushed as a single INSERT. ClickHouse async_insert is enabled server-side
-/// for additional server-side batching.
+/// No client-side buffering — ClickHouse async_insert handles batching server-side.
 async fn clickhouse_writer(
     rx: mpsc::Receiver<ScanEvent>,
     url: &str,
@@ -305,15 +301,17 @@ async fn clickhouse_writer(
 ) -> Result<(u64, u64, u64)> {
     let client = clickhouse::Client::default()
         .with_url(url)
-        .with_database(db);
-
-    let mut inode_batch: Vec<ChInode> = Vec::with_capacity(BATCH_SIZE);
-    let mut dir_batch: Vec<ChDir> = Vec::with_capacity(BATCH_SIZE);
-    let mut extent_batch: Vec<ChExtent> = Vec::with_capacity(BATCH_SIZE);
+        .with_database(db)
+        .with_option("async_insert", "1")
+        .with_option("wait_for_async_insert", "0");
 
     let mut inode_count = 0u64;
     let mut dir_count = 0u64;
     let mut extent_count = 0u64;
+
+    let mut inode_insert = client.insert("inodes")?;
+    let mut dir_insert = client.insert("dirs")?;
+    let mut extent_insert = client.insert("file_extents")?;
 
     for event in &rx {
         match event {
@@ -329,22 +327,21 @@ async fn clickhouse_writer(
                 nblocks,
                 ag_number,
             } => {
-                inode_batch.push(ChInode {
-                    device_id,
-                    ino,
-                    mode,
-                    size,
-                    nlink,
-                    uid,
-                    gid,
-                    mtime_sec,
-                    nblocks,
-                    ag_number,
-                });
+                inode_insert
+                    .write(&ChInode {
+                        device_id,
+                        ino,
+                        mode,
+                        size,
+                        nlink,
+                        uid,
+                        gid,
+                        mtime_sec,
+                        nblocks,
+                        ag_number,
+                    })
+                    .await?;
                 inode_count += 1;
-                if inode_batch.len() >= BATCH_SIZE {
-                    flush_inodes(&client, &mut inode_batch).await?;
-                }
                 if inode_count % 1_000_000 == 0 {
                     info!(
                         "  progress: {} inodes, {} dirs, {} extents",
@@ -359,17 +356,16 @@ async fn clickhouse_writer(
                 name,
                 file_type,
             } => {
-                dir_batch.push(ChDir {
-                    device_id,
-                    parent_ino,
-                    child_ino,
-                    name,
-                    file_type,
-                });
+                dir_insert
+                    .write(&ChDir {
+                        device_id,
+                        parent_ino,
+                        child_ino,
+                        name,
+                        file_type,
+                    })
+                    .await?;
                 dir_count += 1;
-                if dir_batch.len() >= BATCH_SIZE {
-                    flush_dirs(&client, &mut dir_batch).await?;
-                }
             }
             ScanEvent::Extent {
                 device_id,
@@ -378,60 +374,25 @@ async fn clickhouse_writer(
                 physical_offset,
                 length,
             } => {
-                extent_batch.push(ChExtent {
-                    device_id,
-                    ino,
-                    logical_offset,
-                    physical_offset,
-                    length,
-                });
+                extent_insert
+                    .write(&ChExtent {
+                        device_id,
+                        ino,
+                        logical_offset,
+                        physical_offset,
+                        length,
+                    })
+                    .await?;
                 extent_count += 1;
-                if extent_batch.len() >= BATCH_SIZE {
-                    flush_extents(&client, &mut extent_batch).await?;
-                }
             }
         }
     }
 
-    // Flush remaining
-    if !inode_batch.is_empty() {
-        flush_inodes(&client, &mut inode_batch).await?;
-    }
-    if !dir_batch.is_empty() {
-        flush_dirs(&client, &mut dir_batch).await?;
-    }
-    if !extent_batch.is_empty() {
-        flush_extents(&client, &mut extent_batch).await?;
-    }
+    inode_insert.end().await?;
+    dir_insert.end().await?;
+    extent_insert.end().await?;
 
     Ok((inode_count, dir_count, extent_count))
-}
-
-async fn flush_inodes(client: &clickhouse::Client, batch: &mut Vec<ChInode>) -> Result<()> {
-    let mut insert = client.insert("inodes")?;
-    for row in batch.drain(..) {
-        insert.write(&row).await?;
-    }
-    insert.end().await?;
-    Ok(())
-}
-
-async fn flush_dirs(client: &clickhouse::Client, batch: &mut Vec<ChDir>) -> Result<()> {
-    let mut insert = client.insert("dirs")?;
-    for row in batch.drain(..) {
-        insert.write(&row).await?;
-    }
-    insert.end().await?;
-    Ok(())
-}
-
-async fn flush_extents(client: &clickhouse::Client, batch: &mut Vec<ChExtent>) -> Result<()> {
-    let mut insert = client.insert("file_extents")?;
-    for row in batch.drain(..) {
-        insert.write(&row).await?;
-    }
-    insert.end().await?;
-    Ok(())
 }
 
 /// Resolve `--root` paths to actual device paths.
