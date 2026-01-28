@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -305,9 +305,10 @@ fn scan_device(
     Ok(())
 }
 
-/// ClickHouse writer: drains the channel, pushes rows directly.
+/// ClickHouse writer using Inserter API for automatic batching.
 ///
-/// No client-side buffering — ClickHouse async_insert handles batching server-side.
+/// Inserters auto-commit based on row count and time period, preventing
+/// idle connection timeouts on long-running scans.
 async fn clickhouse_writer(
     rx: mpsc::Receiver<ScanEvent>,
     url: &str,
@@ -315,13 +316,7 @@ async fn clickhouse_writer(
 ) -> Result<(u64, u64, u64, u64)> {
     let client = clickhouse::Client::default()
         .with_url(url)
-        .with_database(db)
-        .with_option("async_insert", "1")
-        .with_option("wait_for_async_insert", "0")
-        .with_option("send_timeout", "86400")
-        .with_option("receive_timeout", "86400")
-        .with_option("http_send_timeout", "86400")
-        .with_option("http_receive_timeout", "86400");
+        .with_database(db);
 
     let mut inode_count = 0u64;
     let mut dir_count = 0u64;
@@ -329,16 +324,54 @@ async fn clickhouse_writer(
     let mut xlmeta_count = 0u64;
     let mut total_events = 0u64;
 
-    info!("writer: opening initial insert connections");
-    let mut inode_insert = client.insert("inodes")?;
-    let mut dir_insert = client.insert("dirs")?;
-    let mut extent_insert = client.insert("file_extents")?;
-    let mut xlmeta_insert = client.insert("xlmeta_files")?;
-    info!("writer: connections open, starting drain loop");
+    // Use Inserter with auto-commit every 100k rows or 10 seconds
+    // Wrapped in Option so we can end() them early when scan phase completes
+    info!("writer: creating inserters");
+    let mut inode_ins = Some(
+        client
+            .inserter::<ChInode>("inodes")?
+            .with_max_rows(100_000)
+            .with_period(Some(Duration::from_secs(10))),
+    );
+    let mut dir_ins = client
+        .inserter::<ChDir>("dirs")?
+        .with_max_rows(100_000)
+        .with_period(Some(Duration::from_secs(10)));
+    let mut extent_ins = Some(
+        client
+            .inserter::<ChExtent>("file_extents")?
+            .with_max_rows(100_000)
+            .with_period(Some(Duration::from_secs(10))),
+    );
+    let mut xlmeta_ins = Some(
+        client
+            .inserter::<ChXlmeta>("xlmeta_files")?
+            .with_max_rows(100_000)
+            .with_period(Some(Duration::from_secs(10))),
+    );
+    info!("writer: inserters ready, starting drain loop");
 
-    // Phase 1: Process all events until ScanDone marker
+    let mut last_keepalive = Instant::now();
+
     while let Ok(event) = rx.recv() {
         total_events += 1;
+
+        // Keep all active inserter connections alive by committing periodically
+        // This prevents ClickHouse 30s socket timeout on idle INSERT connections
+        if last_keepalive.elapsed() >= Duration::from_secs(5) {
+            if let Some(ref mut ins) = inode_ins {
+                ins.commit().await.context("keepalive inode")?;
+            }
+            dir_ins.commit().await.context("keepalive dir")?;
+            if let Some(ref mut ins) = extent_ins {
+                ins.commit().await.context("keepalive extent")?;
+            }
+            if let Some(ref mut ins) = xlmeta_ins {
+                ins.commit().await.context("keepalive xlmeta")?;
+            }
+            last_keepalive = Instant::now();
+        }
+
         match event {
             ScanEvent::Inode {
                 device_id,
@@ -349,8 +382,8 @@ async fn clickhouse_writer(
                 nblocks,
                 ag_number,
             } => {
-                inode_insert
-                    .write(&ChInode {
+                if let Some(ref mut ins) = inode_ins {
+                    ins.write(&ChInode {
                         device_id,
                         ino,
                         mode,
@@ -359,9 +392,10 @@ async fn clickhouse_writer(
                         nblocks,
                         ag_number,
                     })
-                    .await
                     .context("write inode")?;
-                inode_count += 1;
+                    ins.commit().await.context("commit inode")?;
+                    inode_count += 1;
+                }
             }
             ScanEvent::Dir {
                 device_id,
@@ -370,7 +404,7 @@ async fn clickhouse_writer(
                 name,
                 file_type,
             } => {
-                dir_insert
+                dir_ins
                     .write(&ChDir {
                         device_id,
                         parent_ino,
@@ -378,8 +412,8 @@ async fn clickhouse_writer(
                         name,
                         file_type,
                     })
-                    .await
                     .context("write dir")?;
+                dir_ins.commit().await.context("commit dir")?;
                 dir_count += 1;
             }
             ScanEvent::Xlmeta {
@@ -387,15 +421,16 @@ async fn clickhouse_writer(
                 parent_ino,
                 child_ino,
             } => {
-                xlmeta_insert
-                    .write(&ChXlmeta {
+                if let Some(ref mut ins) = xlmeta_ins {
+                    ins.write(&ChXlmeta {
                         device_id,
                         parent_ino,
                         child_ino,
                     })
-                    .await
                     .context("write xlmeta")?;
-                xlmeta_count += 1;
+                    ins.commit().await.context("commit xlmeta")?;
+                    xlmeta_count += 1;
+                }
             }
             ScanEvent::Extent {
                 device_id,
@@ -404,30 +439,35 @@ async fn clickhouse_writer(
                 physical_offset,
                 length,
             } => {
-                extent_insert
-                    .write(&ChExtent {
+                if let Some(ref mut ins) = extent_ins {
+                    ins.write(&ChExtent {
                         device_id,
                         ino,
                         logical_offset,
                         physical_offset,
                         length,
                     })
-                    .await
                     .context("write extent")?;
-                extent_count += 1;
+                    ins.commit().await.context("commit extent")?;
+                    extent_count += 1;
+                }
             }
             ScanEvent::ScanDone => {
-                // XFS scan complete - finalize inode/xlmeta/extent inserts immediately
-                // to avoid idle connection timeouts while dirs drain
+                // XFS scan phase complete - end inode/xlmeta/extent inserters now
+                // Dir events may still be queued, but no more inode/extent/xlmeta events will come
                 info!(
                     "writer: scan done, ending inode/xlmeta/extent inserts ({} inodes, {} xlmeta, {} extents)",
                     inode_count, xlmeta_count, extent_count
                 );
-                inode_insert.end().await.context("end inode insert")?;
-                xlmeta_insert.end().await.context("end xlmeta insert")?;
-                extent_insert.end().await.context("end extent insert")?;
-                info!("writer: inode/xlmeta/extent inserts ended, continuing with dirs");
-                break;
+                if let Some(ins) = inode_ins.take() {
+                    ins.end().await.context("end inode insert")?;
+                }
+                if let Some(ins) = xlmeta_ins.take() {
+                    ins.end().await.context("end xlmeta insert")?;
+                }
+                if let Some(ins) = extent_ins.take() {
+                    ins.end().await.context("end extent insert")?;
+                }
             }
         }
 
@@ -439,38 +479,25 @@ async fn clickhouse_writer(
         }
     }
 
-    // Phase 2: Drain remaining Dir events (buffered in channel during scan)
-    while let Ok(event) = rx.recv() {
-        total_events += 1;
-        if let ScanEvent::Dir {
-            device_id,
-            parent_ino,
-            child_ino,
-            name,
-            file_type,
-        } = event
-        {
-            dir_insert
-                .write(&ChDir {
-                    device_id,
-                    parent_ino,
-                    child_ino,
-                    name,
-                    file_type,
-                })
-                .await
-                .context("write dir")?;
-            dir_count += 1;
-        }
-
-        if total_events % 100_000 == 0 {
-            info!("  {}k events | {} dirs (phase 2)", total_events / 1_000, dir_count);
-        }
+    // End any remaining inserters
+    info!(
+        "writer: channel drained, finalizing remaining inserters ({} dirs)",
+        dir_count
+    );
+    if let Some(ins) = inode_ins.take() {
+        ins.end().await.context("end inode inserter")?;
     }
-
-    info!("writer: channel drained, ending dir insert ({} dirs)", dir_count);
-    dir_insert.end().await.context("end dir insert")?;
-    info!("writer: dir insert ended");
+    dir_ins.end().await.context("end dir inserter")?;
+    if let Some(ins) = xlmeta_ins.take() {
+        ins.end().await.context("end xlmeta inserter")?;
+    }
+    if let Some(ins) = extent_ins.take() {
+        ins.end().await.context("end extent inserter")?;
+    }
+    info!(
+        "writer: done ({} inodes, {} dirs, {} xlmeta, {} extents)",
+        inode_count, dir_count, xlmeta_count, extent_count
+    );
 
     Ok((inode_count, dir_count, extent_count, xlmeta_count))
 }
