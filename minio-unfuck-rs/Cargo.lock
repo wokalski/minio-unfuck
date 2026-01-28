@@ -909,6 +909,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "lz4_flex",
+ "quanta",
  "replace_with",
  "sealed",
  "serde",
@@ -1080,6 +1081,12 @@ checksum = "38fe9239af6a04e140c7424d36d1615f37f1804700c17d5339af162add9022e0"
 dependencies = [
  "crc",
 ]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crunchy"
@@ -1466,7 +1473,7 @@ dependencies = [
 [[package]]
 name = "fxfsp"
 version = "0.1.0"
-source = "git+https://github.com/dialohq/fxfsp#6ead65d11752bf9a75941fed94609e743588fd56"
+source = "git+https://github.com/dialohq/fxfsp#d11051cb05b88def7206aefb682212e03c489439"
 dependencies = [
  "aligned-vec",
  "crc32c",
@@ -2598,6 +2605,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "quanta"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ab5a9d756f0d97bdc89019bd2e4ea098cf9cde50ee7564dde6b81ccc8f06c7"
+dependencies = [
+ "crossbeam-utils",
+ "libc",
+ "once_cell",
+ "raw-cpuid",
+ "wasi",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.37.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2740,6 +2762,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags 2.10.0",
 ]
 
 [[package]]

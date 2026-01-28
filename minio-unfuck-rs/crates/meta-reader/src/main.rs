@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use fxfsp::{FsEvent, IoEngine, MaybeInstrumented};
+use fxfsp::{
+    parse_superblock, DirEntryInfo, FileExtentsInfo, FsContext, InodeInfo, IoEngine,
+    MaybeInstrumented,
+};
 use serde::Serialize;
 use tracing::{info, Level};
 
@@ -164,10 +167,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Helper to send extent events for a list of extents
+fn send_extents(
+    tx: &mpsc::Sender<ScanEvent>,
+    device_id: i32,
+    ino: u64,
+    extents: &[fxfsp::Extent],
+    ctx: &FsContext,
+) {
+    let block_size = ctx.block_size as u64;
+    for ext in extents {
+        let phys_offset = ext.start_byte(ctx);
+        let logical_offset = ext.logical_offset * block_size;
+        let length = ext.block_count * block_size;
+        let _ = tx.send(ScanEvent::Extent {
+            device_id,
+            ino: ino as i64,
+            logical_offset: logical_offset as i64,
+            physical_offset: phys_offset as i64,
+            length: length as i64,
+        });
+    }
+}
+
 /// Scan a single XFS device using fxfsp, ingesting into ClickHouse.
 ///
 /// Architecture:
-/// - Scan thread: fxfsp callback pushes owned ScanEvent into unbounded channel
+/// - Scan thread: fxfsp phased API pushes owned ScanEvent into unbounded channel
 /// - Writer thread: drains channel, batches rows, inserts into ClickHouse via HTTP
 fn scan_device(
     ch_url: &str,
@@ -190,102 +216,85 @@ fn scan_device(
         rt.block_on(clickhouse_writer(rx, &url, &db))
     });
 
-    // Scan thread: fxfsp callback pushes into channel
+    // Scan using fxfsp phased API
     let engine = IoEngine::open(device_path, 256 * 1024, 2 * 1024 * 1024)
         .map_err(|e| anyhow::anyhow!("open device: {:?}", e))?;
-    let mut fxfsp_reader = MaybeInstrumented::from_env(engine)
+    let fxfsp_reader = MaybeInstrumented::from_env(engine)
         .map_err(|e| anyhow::anyhow!("instrument reader: {:?}", e))?;
 
-    let mut block_size: u32 = 0;
+    let (sb, mut scanner) = parse_superblock(fxfsp_reader)
+        .map_err(|e| anyhow::anyhow!("parse superblock: {:?}", e))?;
 
-    fxfsp::scan_reader(&mut fxfsp_reader, |event| {
-        match event {
-            FsEvent::Superblock {
-                block_size: bs, ..
-            } => {
-                block_size = *bs;
-            }
-            FsEvent::InodeFound {
-                ag_number,
-                ino,
-                mode,
-                size,
-                mtime_sec,
-                nblocks,
-                extents,
-                ..
-            } => {
-                if max_ags > 0 && *ag_number >= max_ags {
-                    return ControlFlow::Break(());
-                }
+    info!(
+        "Superblock: block_size={} ag_count={} ag_blocks={} inode_size={} root_ino={}",
+        sb.block_size, sb.ag_count, sb.ag_blocks, sb.inode_size, sb.root_ino
+    );
 
+    let ctx = scanner.context().clone();
+
+    // Process each AG
+    while let Some(ag_result) = scanner.next_ag() {
+        let ag = ag_result.map_err(|e| anyhow::anyhow!("get AG: {:?}", e))?;
+        let ag_number = ag.ag_number();
+
+        if max_ags > 0 && ag_number >= max_ags {
+            break;
+        }
+
+        // Phase 1: Scan inodes
+        let phase2 = ag
+            .scan_inodes(|inode: &InodeInfo| {
                 let _ = tx.send(ScanEvent::Inode {
                     device_id,
-                    ino: *ino as i64,
-                    mode: *mode as i32,
-                    size: *size as i64,
-                    mtime_sec: *mtime_sec as i64,
-                    nblocks: *nblocks as i64,
-                    ag_number: *ag_number as i32,
+                    ino: inode.ino as i64,
+                    mode: inode.mode as i32,
+                    size: inode.size as i64,
+                    mtime_sec: inode.mtime_sec as i64,
+                    nblocks: inode.nblocks as i64,
+                    ag_number: inode.ag_number as i32,
                 });
 
-                if let Some(exts) = extents {
-                    for ext in exts {
-                        let phys_offset = ext.start_block * block_size as u64;
-                        let logical_offset = ext.logical_offset * block_size as u64;
-                        let length = ext.block_count * block_size as u64;
-                        let _ = tx.send(ScanEvent::Extent {
-                            device_id,
-                            ino: *ino as i64,
-                            logical_offset: logical_offset as i64,
-                            physical_offset: phys_offset as i64,
-                            length: length as i64,
-                        });
-                    }
+                // Send inline extents if present
+                if let Some(ref exts) = inode.extents {
+                    send_extents(&tx, device_id, inode.ino, exts, &ctx);
                 }
-            }
-            FsEvent::FileExtents { ino, extents } => {
-                for ext in extents {
-                    let phys_offset = ext.start_block * block_size as u64;
-                    let logical_offset = ext.logical_offset * block_size as u64;
-                    let length = ext.block_count * block_size as u64;
-                    let _ = tx.send(ScanEvent::Extent {
-                        device_id,
-                        ino: *ino as i64,
-                        logical_offset: logical_offset as i64,
-                        physical_offset: phys_offset as i64,
-                        length: length as i64,
-                    });
-                }
-            }
-            FsEvent::DirEntry {
-                parent_ino,
-                child_ino,
-                name,
-                file_type,
-            } => {
-                if *name == b"." || *name == b".." {
+
+                ControlFlow::Continue(())
+            })
+            .map_err(|e| anyhow::anyhow!("scan inodes: {:?}", e))?;
+
+        // Phase 1.5: File extents (btree-format files)
+        let phase3 = phase2
+            .scan_file_extents(|fe: &FileExtentsInfo| {
+                send_extents(&tx, device_id, fe.ino, &fe.extents, &ctx);
+                ControlFlow::Continue(())
+            })
+            .map_err(|e| anyhow::anyhow!("scan file extents: {:?}", e))?;
+
+        // Phase 2: Directory entries
+        phase3
+            .scan_dir_entries(|de: &DirEntryInfo| {
+                if de.name == b"." || de.name == b".." {
                     // skip
-                } else if *name == b"xl.meta" {
+                } else if de.name == b"xl.meta" {
                     let _ = tx.send(ScanEvent::Xlmeta {
                         device_id,
-                        parent_ino: *parent_ino as i64,
-                        child_ino: *child_ino as i64,
+                        parent_ino: de.parent_ino as i64,
+                        child_ino: de.child_ino as i64,
                     });
                 } else {
                     let _ = tx.send(ScanEvent::Dir {
                         device_id,
-                        parent_ino: *parent_ino as i64,
-                        child_ino: *child_ino as i64,
-                        name: String::from_utf8_lossy(name).into_owned(),
-                        file_type: *file_type as i32,
+                        parent_ino: de.parent_ino as i64,
+                        child_ino: de.child_ino as i64,
+                        name: String::from_utf8_lossy(de.name).into_owned(),
+                        file_type: de.file_type as i32,
                     });
                 }
-            }
-        }
-        ControlFlow::Continue(())
-    })
-    .map_err(|e| anyhow::anyhow!("fxfsp scan: {:?}", e))?;
+                ControlFlow::Continue(())
+            })
+            .map_err(|e| anyhow::anyhow!("scan dir entries: {:?}", e))?;
+    }
 
     // Signal that XFS scan is done - writer can finalize inode/xlmeta/extent inserts
     let _ = tx.send(ScanEvent::ScanDone);
@@ -428,7 +437,11 @@ async fn clickhouse_writer(
         if total_events % 100_000 == 0 {
             info!(
                 "  {}k events | {} inodes, {} dirs, {} xlmeta, {} extents",
-                total_events / 1_000, inode_count, dir_count, xlmeta_count, extent_count
+                total_events / 1_000,
+                inode_count,
+                dir_count,
+                xlmeta_count,
+                extent_count
             );
         }
     }
