@@ -90,11 +90,18 @@ func main() {
 	}
 }
 
-// runDiskMode runs in raw disk mode (XFS direct access) with fast sync pipeline
-func runDiskMode(ctx context.Context, diskPaths []string, dbPath, listenAddr string, syncOnStart bool, testCount, workers, batchSize int, quickTest bool) {
+func runDiskMode(
+	ctx context.Context,
+	diskPaths []string,
+	dbPath,
+	listenAddr string,
+	syncOnStart bool,
+	testCount,
+	workers,
+	batchSize int,
+	quickTest bool) {
 	log.Printf("Running in raw disk mode with disks: %v", diskPaths)
 
-	// Quick test mode: go through ALL partitions, ALL buckets, count everything (no DB)
 	if quickTest {
 		log.Println("Quick test mode: scanning ALL partitions sequentially (no DB)...")
 
@@ -157,9 +164,6 @@ func runDiskMode(ctx context.Context, diskPaths []string, dbPath, listenAddr str
 			totalKeys += partKeys
 			rawFS.Close()
 			log.Printf("[Partition %d/%d] %d keys in %v", partIdx+1, len(allPartitions), partKeys, time.Since(partStart))
-
-			// Force GC to free Entry slices before next partition
-			runtime.GC()
 		}
 
 		log.Printf("\nQuick test complete: %d total keys across %d partitions in %v",

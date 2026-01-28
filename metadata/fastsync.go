@@ -79,12 +79,10 @@ func (s *FastSyncer) Partitions() []*erasure.RawFS {
 	return s.partitions
 }
 
-// Sync performs a fast directory scan, storing only paths without reading xl.meta
 func (s *FastSyncer) Sync(ctx context.Context) (*FastSyncStats, error) {
 	startTime := time.Now()
 	stats := &FastSyncStats{}
 
-	// Clear existing data for fresh sync
 	if err := s.store.ClearAll(ctx); err != nil {
 		return nil, fmt.Errorf("clear database: %w", err)
 	}

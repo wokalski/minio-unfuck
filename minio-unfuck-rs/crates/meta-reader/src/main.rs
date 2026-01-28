@@ -107,6 +107,9 @@ enum ScanEvent {
         parent_ino: i64,
         child_ino: i64,
     },
+    /// Marker indicating the XFS scan phase is complete.
+    /// Inode/Extent/Xlmeta inserts can be finalized; only Dir events remain.
+    ScanDone,
 }
 
 fn main() -> Result<()> {
@@ -284,6 +287,9 @@ fn scan_device(
     })
     .map_err(|e| anyhow::anyhow!("fxfsp scan: {:?}", e))?;
 
+    // Signal that XFS scan is done - writer can finalize inode/xlmeta/extent inserts
+    let _ = tx.send(ScanEvent::ScanDone);
+
     // Signal writer to finish
     drop(tx);
 
@@ -330,7 +336,8 @@ async fn clickhouse_writer(
     let mut xlmeta_insert = client.insert("xlmeta_files")?;
     info!("writer: connections open, starting drain loop");
 
-    for event in &rx {
+    // Phase 1: Process all events until ScanDone marker
+    while let Ok(event) = rx.recv() {
         total_events += 1;
         match event {
             ScanEvent::Inode {
@@ -409,6 +416,19 @@ async fn clickhouse_writer(
                     .context("write extent")?;
                 extent_count += 1;
             }
+            ScanEvent::ScanDone => {
+                // XFS scan complete - finalize inode/xlmeta/extent inserts immediately
+                // to avoid idle connection timeouts while dirs drain
+                info!(
+                    "writer: scan done, ending inode/xlmeta/extent inserts ({} inodes, {} xlmeta, {} extents)",
+                    inode_count, xlmeta_count, extent_count
+                );
+                inode_insert.end().await.context("end inode insert")?;
+                xlmeta_insert.end().await.context("end xlmeta insert")?;
+                extent_insert.end().await.context("end extent insert")?;
+                info!("writer: inode/xlmeta/extent inserts ended, continuing with dirs");
+                break;
+            }
         }
 
         if total_events % 100_000 == 0 {
@@ -419,18 +439,38 @@ async fn clickhouse_writer(
         }
     }
 
-    info!(
-        "writer: channel drained, calling end() on inserts ({} inodes, {} dirs, {} xlmeta, {} extents)",
-        inode_count, dir_count, xlmeta_count, extent_count
-    );
-    inode_insert.end().await.context("end inode insert")?;
-    info!("writer: inode insert ended");
+    // Phase 2: Drain remaining Dir events (buffered in channel during scan)
+    while let Ok(event) = rx.recv() {
+        total_events += 1;
+        if let ScanEvent::Dir {
+            device_id,
+            parent_ino,
+            child_ino,
+            name,
+            file_type,
+        } = event
+        {
+            dir_insert
+                .write(&ChDir {
+                    device_id,
+                    parent_ino,
+                    child_ino,
+                    name,
+                    file_type,
+                })
+                .await
+                .context("write dir")?;
+            dir_count += 1;
+        }
+
+        if total_events % 100_000 == 0 {
+            info!("  {}k events | {} dirs (phase 2)", total_events / 1_000, dir_count);
+        }
+    }
+
+    info!("writer: channel drained, ending dir insert ({} dirs)", dir_count);
     dir_insert.end().await.context("end dir insert")?;
     info!("writer: dir insert ended");
-    xlmeta_insert.end().await.context("end xlmeta insert")?;
-    info!("writer: xlmeta insert ended");
-    extent_insert.end().await.context("end extent insert")?;
-    info!("writer: extent insert ended");
 
     Ok((inode_count, dir_count, extent_count, xlmeta_count))
 }

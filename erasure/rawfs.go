@@ -2,15 +2,19 @@
 package erasure
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"iter"
 	"os"
 	"syscall"
 	"unsafe"
 
 	"github.com/wokalski/minio-unfuck/vendor_fork/xfs/xfs"
 )
+
+var errStop = errors.New("stop iteration")
 
 // BLKGETSIZE64 ioctl to get block device size in bytes
 const BLKGETSIZE64 = 0x80081272
@@ -170,6 +174,25 @@ func (r *RawFS) ReadFile(path string) ([]byte, error) {
 	}
 	defer f.Close()
 	return io.ReadAll(f)
+}
+
+// All returns an iterator over all entries across all top-level directories.
+// Skips dot-prefixed directories (e.g. .minio.sys).
+func (r *RawFS) All() iter.Seq[xfs.DirEntry] {
+	return func(yield func(xfs.DirEntry) bool) {
+		xfsFS := r.XFS()
+		xfsFS.WalkDirWithInodes(".", func(entry xfs.DirEntry) error {
+			if !entry.IsDir || entry.Name[0] == '.' {
+				return nil
+			}
+			return xfsFS.WalkDirWithInodes(entry.Name, func(child xfs.DirEntry) error {
+				if !yield(child) {
+					return errStop
+				}
+				return nil
+			})
+		})
+	}
 }
 
 // getDeviceSize returns the size of a file or block device
