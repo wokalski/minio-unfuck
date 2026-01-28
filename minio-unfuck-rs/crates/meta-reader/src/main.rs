@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use fxfsp::{FsEvent, IoEngine, MaybeInstrumented};
 use indicatif::{ProgressBar, ProgressStyle};
-use tracing::{info, warn};
+use tracing::{info, warn, Level};
 
 use mfu_core::db::{BulkInserter, MetadataDb};
 use mfu_core::format;
@@ -69,7 +69,9 @@ enum ScanEvent {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .init();
     let args = Args::parse();
 
     info!("meta-reader starting");
@@ -80,13 +82,24 @@ fn main() -> Result<()> {
     let devices = resolve_devices(&args.roots)?;
     info!("Resolved {} device(s): {:?}", devices.len(), devices);
 
-    // Open DuckDB
+    // Open DuckDB and configure for bulk loading
     let db = MetadataDb::open(&args.output).context("open database")?;
+    db.configure_bulk_load().context("configure duckdb")?;
 
     // Phase 1: Scan each device with fxfsp
-    info!("Phase 1: XFS scan of {} device(s)", devices.len());
+    // When --max-ags is set, only scan the first partition (quick test mode).
+    let scan_devices = if args.max_ags > 0 {
+        info!(
+            "Phase 1: XFS scan of 1 device (--max-ags {} limits to first partition)",
+            args.max_ags
+        );
+        &devices[..1]
+    } else {
+        info!("Phase 1: XFS scan of {} device(s)", devices.len());
+        &devices[..]
+    };
 
-    for (device_id, device_path) in devices.iter().enumerate() {
+    for (device_id, device_path) in scan_devices.iter().enumerate() {
         info!("Scanning device {} ({})", device_id, device_path);
         scan_device(&db, device_id as i32, device_path, args.max_ags)
             .with_context(|| format!("scan device {}", device_path))?;
@@ -219,7 +232,7 @@ fn main() -> Result<()> {
 /// - Scan thread: pushes owned ScanEvent variants into a channel (just a memcpy)
 /// - Writer thread: drains the channel into DuckDB via Appender API
 fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32) -> Result<()> {
-    let (tx, rx) = mpsc::sync_channel::<ScanEvent>(64 * 1024);
+    let (tx, rx) = mpsc::channel::<ScanEvent>();
 
     // Writer thread: opens its own connection, drains channel via Appender API
     let db_path = db.path().to_string();

@@ -105,6 +105,17 @@ impl MetadataDb {
         &self.path
     }
 
+    /// Configure DuckDB for maximum bulk-load throughput.
+    pub fn configure_bulk_load(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "SET memory_limit = '8GB';
+             SET threads = 4;
+             SET checkpoint_threshold = '2GB';
+             SET wal_autocheckpoint = '2GB';",
+        ).context("configure bulk load")?;
+        Ok(())
+    }
+
     /// Get a reference to the underlying connection
     pub fn conn(&self) -> &Connection {
         &self.conn
