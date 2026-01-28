@@ -4,6 +4,7 @@
 //! inodes, directory entries, file extents, cluster topology, and parsed xl.meta objects.
 
 use std::ops::ControlFlow;
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
@@ -72,16 +73,20 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     info!("meta-reader starting");
-    info!("devices: {:?}", args.roots);
+    info!("roots: {:?}", args.roots);
     info!("output: {}", args.output);
+
+    // Resolve roots: expand whole-disk devices to their partitions
+    let devices = resolve_devices(&args.roots)?;
+    info!("Resolved {} device(s): {:?}", devices.len(), devices);
 
     // Open DuckDB
     let db = MetadataDb::open(&args.output).context("open database")?;
 
     // Phase 1: Scan each device with fxfsp
-    info!("Phase 1: XFS scan of {} device(s)", args.roots.len());
+    info!("Phase 1: XFS scan of {} device(s)", devices.len());
 
-    for (device_id, device_path) in args.roots.iter().enumerate() {
+    for (device_id, device_path) in devices.iter().enumerate() {
         info!("Scanning device {} ({})", device_id, device_path);
         scan_device(&db, device_id as i32, device_path, args.max_ags)
             .with_context(|| format!("scan device {}", device_path))?;
@@ -89,10 +94,10 @@ fn main() -> Result<()> {
 
     // Phase 2: Read format.json from each device via extents
     info!("Phase 2: Reading format.json files via extents");
-    let reader = PreadDeviceReader::open(&args.roots).context("open device readers")?;
+    let reader = PreadDeviceReader::open(&devices).context("open device readers")?;
 
     let mut formats = Vec::new();
-    for device_id in 0..args.roots.len() {
+    for device_id in 0..devices.len() {
         match read_format_json(&db, &reader, device_id) {
             Ok(fmt) => {
                 info!(
@@ -405,6 +410,62 @@ fn read_format_json(
 
     let data = reader.read_file(device_id, &extents, size as u64)?;
     format::parse_format(&data)
+}
+
+/// Resolve `--root` paths to actual device paths.
+///
+/// If a path points to a whole-disk block device (e.g. `/dev/sde`) that has
+/// partitions, expand it to the sorted list of partition devices
+/// (`/dev/sde1`, `/dev/sde2`, …) via sysfs.  Otherwise return the path as-is
+/// (it's already a partition device or an image file).
+fn resolve_devices(roots: &[String]) -> Result<Vec<String>> {
+    let mut devices = Vec::new();
+    for root in roots {
+        let path = Path::new(root);
+
+        // Try sysfs partition discovery for block devices
+        if let Some(dev_name) = path.file_name().and_then(|n| n.to_str()) {
+            let sysfs_dir = Path::new("/sys/block").join(dev_name);
+            if sysfs_dir.is_dir() {
+                // It's a whole-disk block device — look for partition subdirs
+                let mut parts: Vec<String> = std::fs::read_dir(&sysfs_dir)?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        // Partition dirs are named like "sde1", "nvme0n1p1", etc.
+                        // They start with the device name and have a trailing digit.
+                        if name.starts_with(dev_name) && name.ends_with(|c: char| c.is_ascii_digit()) {
+                            Some(format!("/dev/{}", name))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !parts.is_empty() {
+                    // Sort numerically by partition number
+                    parts.sort_by(|a, b| {
+                        let num_a = a.trim_start_matches(&format!("/dev/{}", dev_name))
+                            .parse::<u32>().unwrap_or(0);
+                        let num_b = b.trim_start_matches(&format!("/dev/{}", dev_name))
+                            .parse::<u32>().unwrap_or(0);
+                        num_a.cmp(&num_b)
+                    });
+                    info!(
+                        "{} is a whole disk with {} partition(s), expanding",
+                        root,
+                        parts.len()
+                    );
+                    devices.extend(parts);
+                    continue;
+                }
+            }
+        }
+
+        // Not a whole disk or no partitions found — use as-is
+        devices.push(root.clone());
+    }
+    Ok(devices)
 }
 
 /// Resolve an xl.meta inode back to bucket/key by walking parent dirs.
