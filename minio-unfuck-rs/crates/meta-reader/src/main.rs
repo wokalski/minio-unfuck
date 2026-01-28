@@ -308,12 +308,16 @@ async fn clickhouse_writer(
     let mut inode_count = 0u64;
     let mut dir_count = 0u64;
     let mut extent_count = 0u64;
+    let mut total_events = 0u64;
 
+    info!("writer: opening initial insert connections");
     let mut inode_insert = client.insert("inodes")?;
     let mut dir_insert = client.insert("dirs")?;
     let mut extent_insert = client.insert("file_extents")?;
+    info!("writer: connections open, starting drain loop");
 
     for event in &rx {
+        total_events += 1;
         match event {
             ScanEvent::Inode {
                 device_id,
@@ -340,14 +344,9 @@ async fn clickhouse_writer(
                         nblocks,
                         ag_number,
                     })
-                    .await?;
+                    .await
+                    .context("write inode")?;
                 inode_count += 1;
-                if inode_count % 1_000_000 == 0 {
-                    info!(
-                        "  progress: {} inodes, {} dirs, {} extents",
-                        inode_count, dir_count, extent_count
-                    );
-                }
             }
             ScanEvent::Dir {
                 device_id,
@@ -364,7 +363,8 @@ async fn clickhouse_writer(
                         name,
                         file_type,
                     })
-                    .await?;
+                    .await
+                    .context("write dir")?;
                 dir_count += 1;
             }
             ScanEvent::Extent {
@@ -382,15 +382,30 @@ async fn clickhouse_writer(
                         physical_offset,
                         length,
                     })
-                    .await?;
+                    .await
+                    .context("write extent")?;
                 extent_count += 1;
             }
         }
+
+        if total_events % 1_000_000 == 0 {
+            info!(
+                "  progress: {} total events ({} inodes, {} dirs, {} extents)",
+                total_events, inode_count, dir_count, extent_count
+            );
+        }
     }
 
-    inode_insert.end().await?;
-    dir_insert.end().await?;
-    extent_insert.end().await?;
+    info!(
+        "writer: channel drained, calling end() on inserts ({} inodes, {} dirs, {} extents)",
+        inode_count, dir_count, extent_count
+    );
+    inode_insert.end().await.context("end inode insert")?;
+    info!("writer: inode insert ended");
+    dir_insert.end().await.context("end dir insert")?;
+    info!("writer: dir insert ended");
+    extent_insert.end().await.context("end extent insert")?;
+    info!("writer: extent insert ended");
 
     Ok((inode_count, dir_count, extent_count))
 }
