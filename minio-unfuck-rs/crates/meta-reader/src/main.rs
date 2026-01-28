@@ -141,7 +141,7 @@ fn main() -> Result<()> {
         let mut parsed = 0u64;
         let mut failed = 0u64;
 
-        db.begin_batch()?;
+        db.conn().execute_batch("BEGIN TRANSACTION")?;
         for result in &results {
             match xlmeta::parse(&result.data) {
                 Ok(mut meta) => {
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
             }
             pb.inc(1);
         }
-        db.commit_batch()?;
+        db.conn().execute_batch("COMMIT")?;
         pb.finish_with_message("done");
 
         info!("Parsed {} objects ({} failed)", parsed, failed);
@@ -186,7 +186,7 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
     let mut block_size: u32 = 0;
     let mut count = 0u64;
 
-    db.begin_batch()?;
+    let mut bulk = db.bulk_inserter()?;
 
     fxfsp::scan_reader(&mut reader, |event| {
         let result: Result<ControlFlow<()>> = (|| {
@@ -215,7 +215,7 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
                         return Ok(ControlFlow::Break(()));
                     }
 
-                    db.insert_inode(
+                    bulk.append_inode(
                         device_id,
                         *ino as i64,
                         *mode as i32,
@@ -231,13 +231,10 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
                     // Insert inline extents if present (FMT_EXTENTS regular files)
                     if let Some(exts) = extents {
                         for ext in exts {
-                            // start_block is an absolute XFS filesystem block number.
-                            // For power-of-2 AG sizes (all real-world XFS), this equals
-                            // the linear block number, so byte offset = block * block_size.
                             let phys_offset = ext.start_block * block_size as u64;
                             let logical_offset = ext.logical_offset * block_size as u64;
                             let length = ext.block_count * block_size as u64;
-                            db.insert_file_extent(
+                            bulk.append_extent(
                                 device_id,
                                 *ino as i64,
                                 logical_offset as i64,
@@ -249,8 +246,6 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
 
                     count += 1;
                     if count % 100_000 == 0 {
-                        db.commit_batch()?;
-                        db.begin_batch()?;
                         info!("  {} inodes processed...", count);
                     }
                 }
@@ -259,7 +254,7 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
                         let phys_offset = ext.start_block * block_size as u64;
                         let logical_offset = ext.logical_offset * block_size as u64;
                         let length = ext.block_count * block_size as u64;
-                        db.insert_file_extent(
+                        bulk.append_extent(
                             device_id,
                             *ino as i64,
                             logical_offset as i64,
@@ -277,7 +272,7 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
                     // Skip "." and ".."
                     if *name != b"." && *name != b".." {
                         let name_str = String::from_utf8_lossy(name);
-                        db.insert_dir(
+                        bulk.append_dir(
                             device_id,
                             *parent_ino as i64,
                             *child_ino as i64,
@@ -300,7 +295,8 @@ fn scan_device(db: &MetadataDb, device_id: i32, device_path: &str, max_ags: u32)
     })
     .map_err(|e| anyhow::anyhow!("fxfsp scan: {:?}", e))?;
 
-    db.commit_batch()?;
+    bulk.flush()?;
+    drop(bulk);
     info!("Device {}: {} inodes scanned", device_id, count);
 
     Ok(())

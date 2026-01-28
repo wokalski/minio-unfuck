@@ -3,7 +3,7 @@
 //! All metadata from XFS scan + parsed xl.meta goes into DuckDB.
 
 use anyhow::{Context, Result};
-use duckdb::{params, Connection};
+use duckdb::{params, Appender, Connection};
 
 use crate::types::{Extent, ObjectMeta};
 
@@ -104,62 +104,17 @@ impl MetadataDb {
         &self.conn
     }
 
-    // --- Bulk insert (for meta-reader) ---
+    // --- Bulk insert via Appender API (for meta-reader) ---
 
-    /// Insert an inode record
-    pub fn insert_inode(
-        &self,
-        device_id: i32,
-        ino: i64,
-        mode: i32,
-        size: i64,
-        nlink: i32,
-        uid: i32,
-        gid: i32,
-        mtime_sec: i64,
-        nblocks: i64,
-        ag_number: i32,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO inodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![device_id, ino, mode, size, nlink, uid, gid, mtime_sec, nblocks, ag_number],
-        )?;
-        Ok(())
+    /// Create a BulkInserter for high-throughput writes during scanning.
+    pub fn bulk_inserter(&self) -> Result<BulkInserter<'_>> {
+        let inodes = self.conn.appender("inodes").context("appender for inodes")?;
+        let dirs = self.conn.appender("dirs").context("appender for dirs")?;
+        let extents = self.conn.appender("file_extents").context("appender for file_extents")?;
+        Ok(BulkInserter { inodes, dirs, extents })
     }
 
-    /// Insert a directory entry
-    pub fn insert_dir(
-        &self,
-        device_id: i32,
-        parent_ino: i64,
-        child_ino: i64,
-        name: &str,
-        file_type: i32,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO dirs VALUES (?, ?, ?, ?, ?)",
-            params![device_id, parent_ino, child_ino, name, file_type],
-        )?;
-        Ok(())
-    }
-
-    /// Insert a file extent
-    pub fn insert_file_extent(
-        &self,
-        device_id: i32,
-        ino: i64,
-        logical_offset: i64,
-        physical_offset: i64,
-        length: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO file_extents VALUES (?, ?, ?, ?, ?)",
-            params![device_id, ino, logical_offset, physical_offset, length],
-        )?;
-        Ok(())
-    }
-
-    /// Insert a parsed object from xl.meta
+    /// Insert a parsed object from xl.meta (uses regular INSERT for OR REPLACE semantics)
     pub fn insert_object(&self, meta: &ObjectMeta) -> Result<()> {
         let dist_json = serde_json::to_string(&meta.distribution.iter().map(|&v| v as i32).collect::<Vec<_>>())?;
         let parts_json = serde_json::to_string(&meta.parts.iter().map(|p| {
@@ -195,6 +150,59 @@ impl MetadataDb {
                 meta.pool_index,
                 meta.set_index,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a directory entry (convenience method for tests and small inserts)
+    pub fn insert_dir(
+        &self,
+        device_id: i32,
+        parent_ino: i64,
+        child_ino: i64,
+        name: &str,
+        file_type: i32,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO dirs VALUES (?, ?, ?, ?, ?)",
+            params![device_id, parent_ino, child_ino, name, file_type],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a file extent (convenience method for tests and small inserts)
+    pub fn insert_file_extent(
+        &self,
+        device_id: i32,
+        ino: i64,
+        logical_offset: i64,
+        physical_offset: i64,
+        length: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_extents VALUES (?, ?, ?, ?, ?)",
+            params![device_id, ino, logical_offset, physical_offset, length],
+        )?;
+        Ok(())
+    }
+
+    /// Insert an inode (convenience method for tests and small inserts)
+    pub fn insert_inode(
+        &self,
+        device_id: i32,
+        ino: i64,
+        mode: i32,
+        size: i64,
+        nlink: i32,
+        uid: i32,
+        gid: i32,
+        mtime_sec: i64,
+        nblocks: i64,
+        ag_number: i32,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO inodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![device_id, ino, mode, size, nlink, uid, gid, mtime_sec, nblocks, ag_number],
         )?;
         Ok(())
     }
@@ -429,15 +437,69 @@ impl MetadataDb {
         Ok(objects)
     }
 
-    /// Begin a transaction for bulk inserts
-    pub fn begin_batch(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN TRANSACTION")?;
+}
+
+/// High-throughput bulk inserter using DuckDB's Appender API.
+/// Bypasses SQL parsing entirely — orders of magnitude faster than individual INSERTs.
+pub struct BulkInserter<'conn> {
+    inodes: Appender<'conn>,
+    dirs: Appender<'conn>,
+    extents: Appender<'conn>,
+}
+
+impl<'conn> BulkInserter<'conn> {
+    pub fn append_inode(
+        &mut self,
+        device_id: i32,
+        ino: i64,
+        mode: i32,
+        size: i64,
+        nlink: i32,
+        uid: i32,
+        gid: i32,
+        mtime_sec: i64,
+        nblocks: i64,
+        ag_number: i32,
+    ) -> Result<()> {
+        self.inodes.append_row(params![
+            device_id, ino, mode, size, nlink, uid, gid, mtime_sec, nblocks, ag_number
+        ])?;
         Ok(())
     }
 
-    /// Commit a batch transaction
-    pub fn commit_batch(&self) -> Result<()> {
-        self.conn.execute_batch("COMMIT")?;
+    pub fn append_dir(
+        &mut self,
+        device_id: i32,
+        parent_ino: i64,
+        child_ino: i64,
+        name: &str,
+        file_type: i32,
+    ) -> Result<()> {
+        self.dirs.append_row(params![
+            device_id, parent_ino, child_ino, name, file_type
+        ])?;
+        Ok(())
+    }
+
+    pub fn append_extent(
+        &mut self,
+        device_id: i32,
+        ino: i64,
+        logical_offset: i64,
+        physical_offset: i64,
+        length: i64,
+    ) -> Result<()> {
+        self.extents.append_row(params![
+            device_id, ino, logical_offset, physical_offset, length
+        ])?;
+        Ok(())
+    }
+
+    /// Flush all appenders. Called automatically on drop, but explicit flush lets you catch errors.
+    pub fn flush(&mut self) -> Result<()> {
+        self.inodes.flush()?;
+        self.dirs.flush()?;
+        self.extents.flush()?;
         Ok(())
     }
 }
