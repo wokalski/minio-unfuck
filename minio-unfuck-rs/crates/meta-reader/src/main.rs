@@ -313,7 +313,9 @@ async fn clickhouse_writer(
         .with_option("async_insert", "1")
         .with_option("wait_for_async_insert", "0")
         .with_option("send_timeout", "86400")
-        .with_option("receive_timeout", "86400");
+        .with_option("receive_timeout", "86400")
+        .with_option("http_send_timeout", "86400")
+        .with_option("http_receive_timeout", "86400");
 
     let mut inode_count = 0u64;
     let mut dir_count = 0u64;
