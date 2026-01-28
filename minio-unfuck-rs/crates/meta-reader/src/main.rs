@@ -46,9 +46,6 @@ struct ChInode {
     ino: i64,
     mode: i32,
     size: i64,
-    nlink: i32,
-    uid: i32,
-    gid: i32,
     mtime_sec: i64,
     nblocks: i64,
     ag_number: i32,
@@ -64,6 +61,13 @@ struct ChDir {
 }
 
 #[derive(clickhouse::Row, Serialize)]
+struct ChXlmeta {
+    device_id: i32,
+    parent_ino: i64,
+    child_ino: i64,
+}
+
+#[derive(clickhouse::Row, Serialize)]
 struct ChExtent {
     device_id: i32,
     ino: i64,
@@ -72,7 +76,7 @@ struct ChExtent {
     length: i64,
 }
 
-// ── Channel event (same as before) ───────────────────────────────────
+// ── Channel events ───────────────────────────────────────────────────
 
 enum ScanEvent {
     Inode {
@@ -80,9 +84,6 @@ enum ScanEvent {
         ino: i64,
         mode: i32,
         size: i64,
-        nlink: i32,
-        uid: i32,
-        gid: i32,
         mtime_sec: i64,
         nblocks: i64,
         ag_number: i32,
@@ -100,6 +101,11 @@ enum ScanEvent {
         child_ino: i64,
         name: String,
         file_type: i32,
+    },
+    Xlmeta {
+        device_id: i32,
+        parent_ino: i64,
+        child_ino: i64,
     },
 }
 
@@ -172,7 +178,7 @@ fn scan_device(
     // Writer thread: runs a tokio runtime, batches events, inserts into ClickHouse
     let url = ch_url.to_string();
     let db = ch_db.to_string();
-    let writer = thread::spawn(move || -> Result<(u64, u64, u64)> {
+    let writer = thread::spawn(move || -> Result<(u64, u64, u64, u64)> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -201,9 +207,6 @@ fn scan_device(
                 ino,
                 mode,
                 size,
-                uid,
-                gid,
-                nlink,
                 mtime_sec,
                 nblocks,
                 extents,
@@ -218,9 +221,6 @@ fn scan_device(
                     ino: *ino as i64,
                     mode: *mode as i32,
                     size: *size as i64,
-                    nlink: *nlink as i32,
-                    uid: *uid as i32,
-                    gid: *gid as i32,
                     mtime_sec: *mtime_sec as i64,
                     nblocks: *nblocks as i64,
                     ag_number: *ag_number as i32,
@@ -261,7 +261,15 @@ fn scan_device(
                 name,
                 file_type,
             } => {
-                if *name != b"." && *name != b".." {
+                if *name == b"." || *name == b".." {
+                    // skip
+                } else if *name == b"xl.meta" {
+                    let _ = tx.send(ScanEvent::Xlmeta {
+                        device_id,
+                        parent_ino: *parent_ino as i64,
+                        child_ino: *child_ino as i64,
+                    });
+                } else {
                     let _ = tx.send(ScanEvent::Dir {
                         device_id,
                         parent_ino: *parent_ino as i64,
@@ -280,12 +288,12 @@ fn scan_device(
     drop(tx);
 
     // Wait for writer and get stats
-    let (inodes, dirs, extents) = writer
+    let (inodes, dirs, extents, xlmetas) = writer
         .join()
         .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
     info!(
-        "Device {}: {} inodes, {} dirs, {} extents",
-        device_id, inodes, dirs, extents
+        "Device {}: {} inodes, {} dirs, {} xlmeta, {} extents",
+        device_id, inodes, dirs, xlmetas, extents
     );
 
     Ok(())
@@ -298,7 +306,7 @@ async fn clickhouse_writer(
     rx: mpsc::Receiver<ScanEvent>,
     url: &str,
     db: &str,
-) -> Result<(u64, u64, u64)> {
+) -> Result<(u64, u64, u64, u64)> {
     let client = clickhouse::Client::default()
         .with_url(url)
         .with_database(db)
@@ -310,12 +318,14 @@ async fn clickhouse_writer(
     let mut inode_count = 0u64;
     let mut dir_count = 0u64;
     let mut extent_count = 0u64;
+    let mut xlmeta_count = 0u64;
     let mut total_events = 0u64;
 
     info!("writer: opening initial insert connections");
     let mut inode_insert = client.insert("inodes")?;
     let mut dir_insert = client.insert("dirs")?;
     let mut extent_insert = client.insert("file_extents")?;
+    let mut xlmeta_insert = client.insert("xlmeta_files")?;
     info!("writer: connections open, starting drain loop");
 
     for event in &rx {
@@ -326,9 +336,6 @@ async fn clickhouse_writer(
                 ino,
                 mode,
                 size,
-                nlink,
-                uid,
-                gid,
                 mtime_sec,
                 nblocks,
                 ag_number,
@@ -339,9 +346,6 @@ async fn clickhouse_writer(
                         ino,
                         mode,
                         size,
-                        nlink,
-                        uid,
-                        gid,
                         mtime_sec,
                         nblocks,
                         ag_number,
@@ -369,6 +373,21 @@ async fn clickhouse_writer(
                     .context("write dir")?;
                 dir_count += 1;
             }
+            ScanEvent::Xlmeta {
+                device_id,
+                parent_ino,
+                child_ino,
+            } => {
+                xlmeta_insert
+                    .write(&ChXlmeta {
+                        device_id,
+                        parent_ino,
+                        child_ino,
+                    })
+                    .await
+                    .context("write xlmeta")?;
+                xlmeta_count += 1;
+            }
             ScanEvent::Extent {
                 device_id,
                 ino,
@@ -392,24 +411,26 @@ async fn clickhouse_writer(
 
         if total_events % 100_000 == 0 {
             info!(
-                "  {}k events | {} inodes, {} dirs, {} extents",
-                total_events / 1_000, inode_count, dir_count, extent_count
+                "  {}k events | {} inodes, {} dirs, {} xlmeta, {} extents",
+                total_events / 1_000, inode_count, dir_count, xlmeta_count, extent_count
             );
         }
     }
 
     info!(
-        "writer: channel drained, calling end() on inserts ({} inodes, {} dirs, {} extents)",
-        inode_count, dir_count, extent_count
+        "writer: channel drained, calling end() on inserts ({} inodes, {} dirs, {} xlmeta, {} extents)",
+        inode_count, dir_count, xlmeta_count, extent_count
     );
     inode_insert.end().await.context("end inode insert")?;
     info!("writer: inode insert ended");
     dir_insert.end().await.context("end dir insert")?;
     info!("writer: dir insert ended");
+    xlmeta_insert.end().await.context("end xlmeta insert")?;
+    info!("writer: xlmeta insert ended");
     extent_insert.end().await.context("end extent insert")?;
     info!("writer: extent insert ended");
 
-    Ok((inode_count, dir_count, extent_count))
+    Ok((inode_count, dir_count, extent_count, xlmeta_count))
 }
 
 /// Resolve `--root` paths to actual device paths.
