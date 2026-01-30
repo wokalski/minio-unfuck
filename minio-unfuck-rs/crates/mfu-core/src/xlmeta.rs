@@ -19,7 +19,7 @@ use anyhow::{bail, ensure, Context, Result};
 use rmp::decode::{self, DecodeStringError};
 use xxhash_rust::xxh64;
 
-use crate::types::{ObjectMeta, PartMeta};
+use crate::types::{ObjectMeta, PartMeta, VersionType};
 
 const XL_HEADER: [u8; 4] = *b"XL2 ";
 
@@ -154,13 +154,16 @@ fn parse_version_meta(data: &[u8]) -> Result<ObjectMeta> {
             "V2Obj" => {
                 parse_v2_obj(&mut cur, &mut meta).context("failed to parse V2Obj")?;
             }
+            "V2DelObj" => {
+                parse_v2_del_obj(&mut cur, &mut meta).context("failed to parse V2DelObj")?;
+            }
             _ => {
                 skip_value(&mut cur).with_context(|| format!("failed to skip field {}", key))?;
             }
         }
     }
 
-    ensure!(version_type == 1, "not an object (type={})", version_type);
+    meta.version_type = VersionType::from_u8(version_type);
     Ok(meta)
 }
 
@@ -292,6 +295,37 @@ fn parse_v2_obj(cur: &mut Cursor<&[u8]>, meta: &mut ObjectMeta) -> Result<()> {
                 size,
                 actual_size,
             });
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse the xlMetaV2DeleteMarker msgpack map (for delete markers)
+fn parse_v2_del_obj(cur: &mut Cursor<&[u8]>, meta: &mut ObjectMeta) -> Result<()> {
+    let map_len = decode::read_map_len(cur).context("failed to read V2DelObj map header")?;
+
+    for _ in 0..map_len {
+        let key = read_string(cur).context("failed to read V2DelObj key")?;
+
+        match key.as_str() {
+            "ID" => {
+                let id = read_bin(cur).context("failed to read ID")?;
+                if id.len() == 16 {
+                    meta.version_id.0.copy_from_slice(&id);
+                }
+            }
+            "MTime" => {
+                meta.mod_time = read_i64(cur).context("failed to read MTime")?;
+            }
+            "MetaSys" => {
+                // System metadata - skip for now, we don't need it for delete markers
+                skip_value(cur).context("failed to skip MetaSys")?;
+            }
+            _ => {
+                skip_value(cur)
+                    .with_context(|| format!("failed to skip V2DelObj field {}", key))?;
+            }
         }
     }
 

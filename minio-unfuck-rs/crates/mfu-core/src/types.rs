@@ -44,12 +44,44 @@ pub struct PartMeta {
     pub actual_size: i64,
 }
 
+/// Version type from xl.meta
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VersionType {
+    #[default]
+    Unknown = 0,
+    Object = 1,
+    DeleteMarker = 2,
+    Legacy = 3,
+}
+
+impl VersionType {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => VersionType::Object,
+            2 => VersionType::DeleteMarker,
+            3 => VersionType::Legacy,
+            _ => VersionType::Unknown,
+        }
+    }
+
+    pub fn is_object(&self) -> bool {
+        matches!(self, VersionType::Object)
+    }
+
+    pub fn is_delete_marker(&self) -> bool {
+        matches!(self, VersionType::DeleteMarker)
+    }
+}
+
 /// Complete object metadata parsed from xl.meta
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     // Object identification
     pub bucket: String,
     pub key: String,
+
+    // Version type (object, delete marker, legacy)
+    pub version_type: VersionType,
 
     // Version info
     pub version_id: Uuid16,
@@ -99,6 +131,7 @@ impl Default for ObjectMeta {
         Self {
             bucket: String::new(),
             key: String::new(),
+            version_type: VersionType::default(),
             version_id: Uuid16::default(),
             data_dir: Uuid16::default(),
             data_blocks: 0,
