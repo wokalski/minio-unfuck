@@ -87,8 +87,14 @@ fn parse_metadata_blob(blob: &[u8]) -> Result<ObjectMeta> {
     let mut cur = Cursor::new(blob);
 
     eprintln!("DEBUG: blob len={}, first 16 bytes: {:02x?}", blob.len(), &blob[0..16.min(blob.len())]);
+    eprintln!("DEBUG: first byte = 0x{:02x}, as fixint would be {}", blob[0], blob[0]);
 
     // Read header version (u8)
+    // Try reading the marker first to see what rmp thinks it is
+    let marker = decode::read_marker(&mut cur);
+    eprintln!("DEBUG: marker = {:?}", marker);
+    cur.set_position(0); // Reset cursor
+
     let _header_version = decode::read_u8(&mut cur).context("failed to read header version")?;
     eprintln!("DEBUG: header_version={}", _header_version);
 
