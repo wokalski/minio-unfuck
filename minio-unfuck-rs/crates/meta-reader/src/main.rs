@@ -332,19 +332,19 @@ async fn clickhouse_writer(
 
     info!("writer: creating inserters");
     let mut inode_ins = client
-        .inserter::<ChInode>("inodes")?
+        .inserter::<ChInode>("inodes")
         .with_max_rows(100_000)
         .with_period(Some(Duration::from_secs(10)));
     let mut dir_ins = client
-        .inserter::<ChDir>("dirs")?
+        .inserter::<ChDir>("dirs")
         .with_max_rows(100_000)
         .with_period(Some(Duration::from_secs(10)));
     let mut extent_ins = client
-        .inserter::<ChExtent>("file_extents")?
+        .inserter::<ChExtent>("file_extents")
         .with_max_rows(100_000)
         .with_period(Some(Duration::from_secs(10)));
     let mut xlmeta_ins = client
-        .inserter::<ChXlmeta>("xlmeta_files")?
+        .inserter::<ChXlmeta>("xlmeta_files")
         .with_max_rows(100_000)
         .with_period(Some(Duration::from_secs(10)));
     info!("writer: inserters ready, starting drain loop");
@@ -372,6 +372,7 @@ async fn clickhouse_writer(
                         nblocks,
                         ag_number,
                     })
+                    .await
                     .context("write inode")?;
                 inode_ins.commit().await.context("commit inode")?;
                 inode_count += 1;
@@ -391,6 +392,7 @@ async fn clickhouse_writer(
                         name,
                         file_type,
                     })
+                    .await
                     .context("write dir")?;
                 dir_ins.commit().await.context("commit dir")?;
                 dir_count += 1;
@@ -406,6 +408,7 @@ async fn clickhouse_writer(
                         parent_ino,
                         child_ino,
                     })
+                    .await
                     .context("write xlmeta")?;
                 xlmeta_ins.commit().await.context("commit xlmeta")?;
                 xlmeta_count += 1;
@@ -425,6 +428,7 @@ async fn clickhouse_writer(
                         physical_offset,
                         length,
                     })
+                    .await
                     .context("write extent")?;
                 extent_ins.commit().await.context("commit extent")?;
                 extent_count += 1;

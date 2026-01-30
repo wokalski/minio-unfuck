@@ -481,7 +481,7 @@ async fn insert_objects(client: &clickhouse::Client, objects: &mut Vec<ChObject>
         return Ok(());
     }
 
-    let mut inserter = client.insert("objects")?;
+    let mut inserter = client.insert::<ChObject>("objects").await?;
     for obj in objects.drain(..) {
         inserter.write(&obj).await.context("write object")?;
     }
