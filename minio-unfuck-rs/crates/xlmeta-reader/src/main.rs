@@ -139,32 +139,64 @@ async fn run(args: Args) -> Result<()> {
     let reader = PreadDeviceReader::open(&devices).context("open devices")?;
 
     // Phase 1: Query xl.meta locations (one per object, deduplicated)
-    // Avoid JOINs by querying s3_xlmeta_locations directly, then fetch inode sizes separately
-    info!("Phase 1: Querying xl.meta locations...");
+    // Process per-device to avoid memory issues and UTF-8 parsing problems
+    info!("Phase 1: Querying xl.meta locations (per device)...");
 
-    let limit_clause = args.limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
+    let mut xlmeta_locs: Vec<XlmetaLocation> = Vec::new();
+    let mut total_limit_remaining = args.limit;
 
-    // Simple query on s3_xlmeta_locations - no JOINs, no GROUP BY
-    // Select one row per (bucket, key) using argMin to pick by device_id
-    let xlmeta_query = format!(r#"
-        SELECT DISTINCT ON (bucket, key)
-            bucket,
-            key,
-            device_id,
-            xlmeta_ino,
-            data_dir_ino,
-            0 as size,
-            0 as first_physical_offset
-        FROM s3_xlmeta_locations
-        ORDER BY bucket, key, device_id
-        {}
-    "#, limit_clause);
+    for (device_idx, _device_path) in devices.iter().enumerate() {
+        let device_id = device_idx as i32;
 
-    let xlmeta_locs: Vec<XlmetaLocation> = client
-        .query(&xlmeta_query)
-        .fetch_all()
-        .await
-        .context("query xlmeta locations")?;
+        // Check if we've hit the limit
+        if let Some(remaining) = total_limit_remaining {
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        let limit_clause = total_limit_remaining
+            .map(|l| format!("LIMIT {}", l))
+            .unwrap_or_default();
+
+        // Query just this device - much smaller result set
+        let xlmeta_query = format!(r#"
+            SELECT DISTINCT ON (bucket, key)
+                bucket,
+                key,
+                device_id,
+                xlmeta_ino,
+                data_dir_ino,
+                0 as size,
+                0 as first_physical_offset
+            FROM s3_xlmeta_locations
+            WHERE device_id = {}
+            ORDER BY bucket, key, device_id
+            {}
+        "#, device_id, limit_clause);
+
+        let device_locs: Vec<XlmetaLocation> = client
+            .query(&xlmeta_query)
+            .fetch_all()
+            .await
+            .with_context(|| format!("query xlmeta locations for device {}", device_id))?;
+
+        let found = device_locs.len();
+        if found > 0 {
+            info!("  Device {}: {} objects", device_id, found);
+        }
+
+        xlmeta_locs.extend(device_locs);
+
+        // Update remaining limit
+        if let Some(ref mut remaining) = total_limit_remaining {
+            if found >= *remaining {
+                *remaining = 0;
+            } else {
+                *remaining -= found;
+            }
+        }
+    }
 
     info!(
         "Found {} unique objects to process{}",
