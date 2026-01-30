@@ -23,6 +23,30 @@ use crate::types::{ObjectMeta, PartMeta};
 
 const XL_HEADER: [u8; 4] = *b"XL2 ";
 
+/// Read a u8 value from cursor, handling both positive fixint and uint8 formats.
+/// This is a workaround for rmp::decode::read_u8 which seems to have issues.
+fn read_u8_value(cur: &mut Cursor<&[u8]>) -> Result<u8> {
+    let pos = cur.position() as usize;
+    let data_len = cur.get_ref().len();
+    ensure!(pos < data_len, "unexpected end of data reading u8");
+
+    let byte = cur.get_ref()[pos];
+
+    if byte <= 0x7f {
+        // Positive fixint: value is the byte itself
+        cur.set_position(pos as u64 + 1);
+        Ok(byte)
+    } else if byte == 0xcc {
+        // uint8: next byte is the value
+        ensure!(pos + 1 < data_len, "truncated uint8");
+        let val = cur.get_ref()[pos + 1];
+        cur.set_position(pos as u64 + 2);
+        Ok(val)
+    } else {
+        bail!("expected u8, got marker 0x{:02x}", byte)
+    }
+}
+
 /// Parse an xl.meta file and return object metadata.
 pub fn parse(data: &[u8]) -> Result<ObjectMeta> {
     ensure!(data.len() >= 8, "xl.meta too short: {} bytes", data.len());
@@ -54,14 +78,11 @@ pub fn parse(data: &[u8]) -> Result<ObjectMeta> {
 fn parse_v1_3(payload: &[u8]) -> Result<ObjectMeta> {
     let mut cur = Cursor::new(payload);
 
-    eprintln!("DEBUG parse_v1_3: payload len={}, first 16 bytes: {:02x?}", payload.len(), &payload[0..16.min(payload.len())]);
-
     // Read metadata blob (msgpack bin)
     let blob_len =
         decode::read_bin_len(&mut cur).context("failed to read metadata blob length")?;
     let blob_start = cur.position() as usize;
     let blob_end = blob_start + blob_len as usize;
-    eprintln!("DEBUG: blob_len={}, blob_start={}, blob_end={}, payload.len()={}", blob_len, blob_start, blob_end, payload.len());
     ensure!(
         blob_end <= payload.len(),
         "metadata blob extends beyond payload"
@@ -86,45 +107,11 @@ fn parse_v1_3(payload: &[u8]) -> Result<ObjectMeta> {
 fn parse_metadata_blob(blob: &[u8]) -> Result<ObjectMeta> {
     let mut cur = Cursor::new(blob);
 
-    eprintln!("DEBUG: blob len={}, first 16 bytes: {:02x?}", blob.len(), &blob[0..16.min(blob.len())]);
-    eprintln!("DEBUG: first byte = 0x{:02x}, as fixint would be {}", blob[0], blob[0]);
+    // Read header version (u8) - manually to avoid rmp read_u8 issues
+    let _header_version = read_u8_value(&mut cur).context("failed to read header version")?;
 
-    // Read header version (u8)
-    // Try reading the marker first to see what rmp thinks it is
-    let marker = decode::read_marker(&mut cur);
-    eprintln!("DEBUG: marker = {:?}, cursor pos after = {}", marker, cur.position());
-    cur.set_position(0); // Reset cursor
-    eprintln!("DEBUG: cursor reset to 0");
-
-    // Try reading manually instead of using read_u8
-    let first_byte = blob[0];
-    let header_version = if first_byte <= 0x7f {
-        // Positive fixint
-        cur.set_position(1);
-        first_byte
-    } else if first_byte == 0xcc {
-        // uint8
-        cur.set_position(2);
-        blob[1]
-    } else {
-        bail!("unexpected marker for header_version: 0x{:02x}", first_byte);
-    };
-    eprintln!("DEBUG: header_version (manual) = {}", header_version);
-    let _header_version = header_version;
-
-    // Read meta version (u8) - also manually to avoid rmp issue
-    let pos = cur.position() as usize;
-    let meta_byte = blob[pos];
-    let _meta_version = if meta_byte <= 0x7f {
-        cur.set_position(pos as u64 + 1);
-        meta_byte
-    } else if meta_byte == 0xcc {
-        cur.set_position(pos as u64 + 2);
-        blob[pos + 1]
-    } else {
-        bail!("unexpected marker for meta_version: 0x{:02x}", meta_byte);
-    };
-    eprintln!("DEBUG: meta_version (manual) = {}", _meta_version);
+    // Read meta version (u8)
+    let _meta_version = read_u8_value(&mut cur).context("failed to read meta version")?;
 
     // Read version count
     let versions = read_int(&mut cur).context("failed to read version count")?;
@@ -162,7 +149,7 @@ fn parse_version_meta(data: &[u8]) -> Result<ObjectMeta> {
 
         match key.as_str() {
             "Type" => {
-                version_type = decode::read_u8(&mut cur).context("failed to read Type")?;
+                version_type = read_u8_value(&mut cur).context("failed to read Type")?;
             }
             "V2Obj" => {
                 parse_v2_obj(&mut cur, &mut meta).context("failed to parse V2Obj")?;
@@ -202,7 +189,7 @@ fn parse_v2_obj(cur: &mut Cursor<&[u8]>, meta: &mut ObjectMeta) -> Result<()> {
                 }
             }
             "EcAlgo" => {
-                let _algo = decode::read_u8(cur).context("failed to read EcAlgo")?;
+                let _algo = read_u8_value(cur).context("failed to read EcAlgo")?;
             }
             "EcM" => {
                 meta.data_blocks =
@@ -224,13 +211,13 @@ fn parse_v2_obj(cur: &mut Cursor<&[u8]>, meta: &mut ObjectMeta) -> Result<()> {
                     decode::read_array_len(cur).context("failed to read EcDist header")?;
                 meta.distribution = Vec::with_capacity(arr_len as usize);
                 for j in 0..arr_len {
-                    let v = decode::read_u8(cur)
+                    let v = read_u8_value(cur)
                         .with_context(|| format!("failed to read EcDist[{}]", j))?;
                     meta.distribution.push(v);
                 }
             }
             "CSumAlgo" => {
-                let _algo = decode::read_u8(cur).context("failed to read CSumAlgo")?;
+                let _algo = read_u8_value(cur).context("failed to read CSumAlgo")?;
             }
             "PartNums" => {
                 let arr_len =
@@ -356,9 +343,9 @@ fn parse_string_map(cur: &mut Cursor<&[u8]>) -> Result<HashMap<String, String>> 
 /// Read a msgpack integer (handles int/uint of various sizes)
 fn read_int(cur: &mut Cursor<&[u8]>) -> Result<i64> {
     let pos = cur.position() as usize;
-    let data = cur.get_ref();
-    ensure!(pos < data.len(), "unexpected end of data reading int");
-    let marker = data[pos];
+    let data_len = cur.get_ref().len();
+    ensure!(pos < data_len, "unexpected end of data reading int");
+    let marker = cur.get_ref()[pos];
 
     // Positive fixint: 0x00..0x7f
     if marker <= 0x7f {
@@ -373,44 +360,60 @@ fn read_int(cur: &mut Cursor<&[u8]>) -> Result<i64> {
 
     match marker {
         0xcc => {
-            // uint8
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_u8(cur)? as i64)
+            // uint8: marker + 1 byte
+            ensure!(pos + 1 < data_len, "truncated uint8");
+            let val = cur.get_ref()[pos + 1];
+            cur.set_position(pos as u64 + 2);
+            Ok(val as i64)
         }
         0xcd => {
-            // uint16
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_u16(cur)? as i64)
+            // uint16: marker + 2 bytes (big-endian)
+            ensure!(pos + 2 < data_len, "truncated uint16");
+            let bytes = [cur.get_ref()[pos + 1], cur.get_ref()[pos + 2]];
+            cur.set_position(pos as u64 + 3);
+            Ok(u16::from_be_bytes(bytes) as i64)
         }
         0xce => {
-            // uint32
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_u32(cur)? as i64)
+            // uint32: marker + 4 bytes (big-endian)
+            ensure!(pos + 4 < data_len, "truncated uint32");
+            let bytes = peek_bytes_4(cur, pos + 1)?;
+            cur.set_position(pos as u64 + 5);
+            Ok(u32::from_be_bytes(bytes) as i64)
         }
         0xcf => {
-            // uint64
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_u64(cur)? as i64)
+            // uint64: marker + 8 bytes (big-endian)
+            ensure!(pos + 8 < data_len, "truncated uint64");
+            let bytes = peek_bytes_8(cur, pos + 1)?;
+            cur.set_position(pos as u64 + 9);
+            Ok(u64::from_be_bytes(bytes) as i64)
         }
         0xd0 => {
-            // int8
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_i8(cur)? as i64)
+            // int8: marker + 1 byte
+            ensure!(pos + 1 < data_len, "truncated int8");
+            let val = cur.get_ref()[pos + 1] as i8;
+            cur.set_position(pos as u64 + 2);
+            Ok(val as i64)
         }
         0xd1 => {
-            // int16
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_i16(cur)? as i64)
+            // int16: marker + 2 bytes (big-endian)
+            ensure!(pos + 2 < data_len, "truncated int16");
+            let bytes = [cur.get_ref()[pos + 1], cur.get_ref()[pos + 2]];
+            cur.set_position(pos as u64 + 3);
+            Ok(i16::from_be_bytes(bytes) as i64)
         }
         0xd2 => {
-            // int32
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_i32(cur)? as i64)
+            // int32: marker + 4 bytes (big-endian)
+            ensure!(pos + 4 < data_len, "truncated int32");
+            let bytes = peek_bytes_4(cur, pos + 1)?;
+            cur.set_position(pos as u64 + 5);
+            Ok(i32::from_be_bytes(bytes) as i64)
         }
         0xd3 => {
-            // int64
-            cur.set_position(pos as u64 + 1);
-            Ok(decode::read_i64(cur)? as i64)
+            // int64: marker + 8 bytes (big-endian)
+            ensure!(pos + 8 < data_len, "truncated int64");
+            let bytes = peek_bytes_8(cur, pos + 1)?;
+            cur.set_position(pos as u64 + 9);
+            Ok(i64::from_be_bytes(bytes))
         }
         _ => bail!("expected int, got marker 0x{:02x}", marker),
     }
@@ -647,6 +650,16 @@ fn peek_bytes_4(cur: &Cursor<&[u8]>, offset: usize) -> Result<[u8; 4]> {
     let data = cur.get_ref();
     ensure!(offset + 4 <= data.len(), "truncated at offset {}", offset);
     Ok([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+}
+
+/// Peek 8 bytes at offset
+fn peek_bytes_8(cur: &Cursor<&[u8]>, offset: usize) -> Result<[u8; 8]> {
+    let data = cur.get_ref();
+    ensure!(offset + 8 <= data.len(), "truncated at offset {}", offset);
+    Ok([
+        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+    ])
 }
 
 fn is_str_marker(m: u8) -> bool {
