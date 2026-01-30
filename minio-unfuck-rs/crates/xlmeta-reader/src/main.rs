@@ -144,19 +144,19 @@ async fn run(args: Args) -> Result<()> {
 
     let limit_clause = args.limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
 
-    // Simple query on s3_xlmeta_locations - no JOINs
+    // Simple query on s3_xlmeta_locations - no JOINs, no GROUP BY
+    // Select one row per (bucket, key) using argMin to pick by device_id
     let xlmeta_query = format!(r#"
-        SELECT
+        SELECT DISTINCT ON (bucket, key)
             bucket,
             key,
-            any(device_id) as device_id,
-            any(xlmeta_ino) as xlmeta_ino,
-            any(data_dir_ino) as data_dir_ino,
+            device_id,
+            xlmeta_ino,
+            data_dir_ino,
             0 as size,
             0 as first_physical_offset
         FROM s3_xlmeta_locations
-        GROUP BY bucket, key
-        ORDER BY device_id
+        ORDER BY bucket, key, device_id
         {}
     "#, limit_clause);
 
