@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/mfu-core",
     "crates/meta-reader",
+    "crates/xlmeta-reader",
     "crates/s3-server",
     "crates/dbcat",
 ]
