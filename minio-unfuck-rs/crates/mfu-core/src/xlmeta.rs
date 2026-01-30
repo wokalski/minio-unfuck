@@ -92,11 +92,25 @@ fn parse_metadata_blob(blob: &[u8]) -> Result<ObjectMeta> {
     // Read header version (u8)
     // Try reading the marker first to see what rmp thinks it is
     let marker = decode::read_marker(&mut cur);
-    eprintln!("DEBUG: marker = {:?}", marker);
+    eprintln!("DEBUG: marker = {:?}, cursor pos after = {}", marker, cur.position());
     cur.set_position(0); // Reset cursor
+    eprintln!("DEBUG: cursor reset to 0");
 
-    let _header_version = decode::read_u8(&mut cur).context("failed to read header version")?;
-    eprintln!("DEBUG: header_version={}", _header_version);
+    // Try reading manually instead of using read_u8
+    let first_byte = blob[0];
+    let header_version = if first_byte <= 0x7f {
+        // Positive fixint
+        cur.set_position(1);
+        first_byte
+    } else if first_byte == 0xcc {
+        // uint8
+        cur.set_position(2);
+        blob[1]
+    } else {
+        bail!("unexpected marker for header_version: 0x{:02x}", first_byte);
+    };
+    eprintln!("DEBUG: header_version (manual) = {}", header_version);
+    let _header_version = header_version;
 
     // Read meta version (u8)
     let _meta_version = decode::read_u8(&mut cur).context("failed to read meta version")?;
