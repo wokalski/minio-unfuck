@@ -54,11 +54,14 @@ pub fn parse(data: &[u8]) -> Result<ObjectMeta> {
 fn parse_v1_3(payload: &[u8]) -> Result<ObjectMeta> {
     let mut cur = Cursor::new(payload);
 
+    eprintln!("DEBUG parse_v1_3: payload len={}, first 16 bytes: {:02x?}", payload.len(), &payload[0..16.min(payload.len())]);
+
     // Read metadata blob (msgpack bin)
     let blob_len =
         decode::read_bin_len(&mut cur).context("failed to read metadata blob length")?;
     let blob_start = cur.position() as usize;
     let blob_end = blob_start + blob_len as usize;
+    eprintln!("DEBUG: blob_len={}, blob_start={}, blob_end={}, payload.len()={}", blob_len, blob_start, blob_end, payload.len());
     ensure!(
         blob_end <= payload.len(),
         "metadata blob extends beyond payload"
@@ -83,8 +86,11 @@ fn parse_v1_3(payload: &[u8]) -> Result<ObjectMeta> {
 fn parse_metadata_blob(blob: &[u8]) -> Result<ObjectMeta> {
     let mut cur = Cursor::new(blob);
 
+    eprintln!("DEBUG: blob len={}, first 16 bytes: {:02x?}", blob.len(), &blob[0..16.min(blob.len())]);
+
     // Read header version (u8)
     let _header_version = decode::read_u8(&mut cur).context("failed to read header version")?;
+    eprintln!("DEBUG: header_version={}", _header_version);
 
     // Read meta version (u8)
     let _meta_version = decode::read_u8(&mut cur).context("failed to read meta version")?;
