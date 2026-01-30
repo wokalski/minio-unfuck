@@ -161,6 +161,7 @@ async fn run(args: Args) -> Result<()> {
 
         // Query just this device - much smaller result set
         // Use toValidUTF8() to handle any non-UTF8 bytes in bucket/key
+        // Cast literal 0s to proper types for schema validation
         let xlmeta_query = format!(r#"
             SELECT DISTINCT ON (bucket, key)
                 toValidUTF8(bucket) as bucket,
@@ -168,8 +169,8 @@ async fn run(args: Args) -> Result<()> {
                 device_id,
                 xlmeta_ino,
                 data_dir_ino,
-                0 as size,
-                0 as first_physical_offset
+                toInt64(0) as size,
+                toInt64(0) as first_physical_offset
             FROM s3_xlmeta_locations
             WHERE device_id = {}
             ORDER BY bucket, key, device_id
