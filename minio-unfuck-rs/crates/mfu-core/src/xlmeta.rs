@@ -112,8 +112,19 @@ fn parse_metadata_blob(blob: &[u8]) -> Result<ObjectMeta> {
     eprintln!("DEBUG: header_version (manual) = {}", header_version);
     let _header_version = header_version;
 
-    // Read meta version (u8)
-    let _meta_version = decode::read_u8(&mut cur).context("failed to read meta version")?;
+    // Read meta version (u8) - also manually to avoid rmp issue
+    let pos = cur.position() as usize;
+    let meta_byte = blob[pos];
+    let _meta_version = if meta_byte <= 0x7f {
+        cur.set_position(pos as u64 + 1);
+        meta_byte
+    } else if meta_byte == 0xcc {
+        cur.set_position(pos as u64 + 2);
+        blob[pos + 1]
+    } else {
+        bail!("unexpected marker for meta_version: 0x{:02x}", meta_byte);
+    };
+    eprintln!("DEBUG: meta_version (manual) = {}", _meta_version);
 
     // Read version count
     let versions = read_int(&mut cur).context("failed to read version count")?;
