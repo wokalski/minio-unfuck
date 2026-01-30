@@ -145,6 +145,7 @@ async fn run(args: Args) -> Result<()> {
     let limit_clause = args.limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
 
     // Use a subquery to get one xl.meta per (bucket, key), then join for extents
+    // Add memory-efficient settings for large joins
     let xlmeta_query = format!(r#"
         WITH unique_objects AS (
             SELECT
@@ -170,6 +171,10 @@ async fn run(args: Args) -> Result<()> {
         JOIN file_extents fe ON fe.device_id = u.device_id AND fe.ino = u.xlmeta_ino
         GROUP BY u.bucket, u.key, u.device_id, u.xlmeta_ino, u.data_dir_ino, i.size
         ORDER BY u.device_id, first_physical_offset
+        SETTINGS
+            join_algorithm = 'partial_merge',
+            max_bytes_before_external_group_by = 10000000000,
+            max_memory_usage = 20000000000
     "#, limit_clause);
 
     let xlmeta_locs: Vec<XlmetaLocation> = client
