@@ -160,10 +160,11 @@ async fn run(args: Args) -> Result<()> {
             .unwrap_or_default();
 
         // Query just this device - much smaller result set
+        // Use toValidUTF8() to handle any non-UTF8 bytes in bucket/key
         let xlmeta_query = format!(r#"
             SELECT DISTINCT ON (bucket, key)
-                bucket,
-                key,
+                toValidUTF8(bucket) as bucket,
+                toValidUTF8(key) as key,
                 device_id,
                 xlmeta_ino,
                 data_dir_ino,
