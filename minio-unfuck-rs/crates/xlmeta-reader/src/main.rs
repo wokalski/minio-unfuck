@@ -131,9 +131,12 @@ async fn run(args: Args) -> Result<()> {
         .with_url(&args.clickhouse_url)
         .with_database(&args.clickhouse_db);
 
+    // Resolve roots: expand whole-disk devices to their partitions
+    let devices = resolve_devices(&args.roots)?;
+    info!("Resolved {} device(s): {:?}", devices.len(), devices);
+
     // Open raw devices
-    info!("Opening {} device(s)...", args.roots.len());
-    let reader = PreadDeviceReader::open(&args.roots).context("open devices")?;
+    let reader = PreadDeviceReader::open(&devices).context("open devices")?;
 
     // Phase 1: Query xl.meta locations (one per object, deduplicated)
     info!("Phase 1: Querying xl.meta locations...");
@@ -447,4 +450,63 @@ async fn populate_file_shards(client: &clickhouse::Client) -> Result<()> {
     info!("file_shards table: {} rows", count);
 
     Ok(())
+}
+
+/// Resolve `--root` paths to actual device paths.
+///
+/// If a path points to a whole-disk block device (e.g. `/dev/sde`) that has
+/// partitions, expand it to the sorted list of partition devices
+/// (`/dev/sde1`, `/dev/sde2`, …) via sysfs. Otherwise return the path as-is.
+fn resolve_devices(roots: &[String]) -> Result<Vec<String>> {
+    use std::path::Path;
+
+    let mut devices = Vec::new();
+    for root in roots {
+        let path = Path::new(root);
+
+        // Try sysfs partition discovery for block devices
+        if let Some(dev_name) = path.file_name().and_then(|n| n.to_str()) {
+            let sysfs_dir = Path::new("/sys/block").join(dev_name);
+            if sysfs_dir.is_dir() {
+                // It's a whole-disk block device — look for partition subdirs
+                let mut parts: Vec<String> = std::fs::read_dir(&sysfs_dir)?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().into_owned();
+                        if name.starts_with(dev_name)
+                            && name.ends_with(|c: char| c.is_ascii_digit())
+                        {
+                            Some(format!("/dev/{}", name))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !parts.is_empty() {
+                    parts.sort_by(|a, b| {
+                        let num_a = a
+                            .trim_start_matches(&format!("/dev/{}", dev_name))
+                            .parse::<u32>()
+                            .unwrap_or(0);
+                        let num_b = b
+                            .trim_start_matches(&format!("/dev/{}", dev_name))
+                            .parse::<u32>()
+                            .unwrap_or(0);
+                        num_a.cmp(&num_b)
+                    });
+                    info!(
+                        "{} is a whole disk with {} partition(s), expanding",
+                        root,
+                        parts.len()
+                    );
+                    devices.extend(parts);
+                    continue;
+                }
+            }
+        }
+
+        devices.push(root.clone());
+    }
+    Ok(devices)
 }
