@@ -139,74 +139,58 @@ async fn run(args: Args) -> Result<()> {
     let reader = PreadDeviceReader::open(&devices).context("open devices")?;
 
     // Phase 1: Query xl.meta locations (one per object, deduplicated)
-    // Process one device at a time to reduce memory pressure
-    info!("Phase 1: Querying xl.meta locations (per device)...");
+    // Avoid JOINs by querying s3_xlmeta_locations directly, then fetch inode sizes separately
+    info!("Phase 1: Querying xl.meta locations...");
 
-    let mut xlmeta_locs: Vec<XlmetaLocation> = Vec::new();
-    let mut total_limit_remaining = args.limit;
+    let limit_clause = args.limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
 
-    for (device_idx, _device_path) in devices.iter().enumerate() {
-        let device_id = device_idx as i32;
+    // Simple query on s3_xlmeta_locations - no JOINs
+    let xlmeta_query = format!(r#"
+        SELECT
+            bucket,
+            key,
+            any(device_id) as device_id,
+            any(xlmeta_ino) as xlmeta_ino,
+            any(data_dir_ino) as data_dir_ino,
+            0 as size,
+            0 as first_physical_offset
+        FROM s3_xlmeta_locations
+        GROUP BY bucket, key
+        ORDER BY device_id
+        {}
+    "#, limit_clause);
 
-        // Build per-device limit clause
-        let limit_clause = total_limit_remaining
-            .map(|l| format!("LIMIT {}", l))
-            .unwrap_or_default();
-
-        // Query for this device only - much smaller joins
-        let xlmeta_query = format!(r#"
-            WITH unique_objects AS (
-                SELECT
-                    bucket,
-                    key,
-                    any(xlmeta_ino) as xlmeta_ino,
-                    any(data_dir_ino) as data_dir_ino
-                FROM s3_xlmeta_locations
-                WHERE device_id = {}
-                GROUP BY bucket, key
-                {}
-            )
-            SELECT
-                u.bucket,
-                u.key,
-                {} as device_id,
-                u.xlmeta_ino,
-                u.data_dir_ino,
-                i.size,
-                min(fe.physical_offset) as first_physical_offset
-            FROM unique_objects u
-            JOIN inodes i ON i.device_id = {} AND i.ino = u.xlmeta_ino
-            JOIN file_extents fe ON fe.device_id = {} AND fe.ino = u.xlmeta_ino
-            GROUP BY u.bucket, u.key, u.xlmeta_ino, u.data_dir_ino, i.size
-            ORDER BY first_physical_offset
-        "#, device_id, limit_clause, device_id, device_id, device_id);
-
-        let device_locs: Vec<XlmetaLocation> = client
-            .query(&xlmeta_query)
-            .fetch_all()
-            .await
-            .with_context(|| format!("query xlmeta locations for device {}", device_id))?;
-
-        let found = device_locs.len();
-        info!("  Device {}: {} objects", device_id, found);
-
-        xlmeta_locs.extend(device_locs);
-
-        // Update remaining limit
-        if let Some(ref mut remaining) = total_limit_remaining {
-            if found >= *remaining {
-                *remaining = 0;
-                break;
-            }
-            *remaining -= found;
-        }
-    }
+    let xlmeta_locs: Vec<XlmetaLocation> = client
+        .query(&xlmeta_query)
+        .fetch_all()
+        .await
+        .context("query xlmeta locations")?;
 
     info!(
         "Found {} unique objects to process{}",
         xlmeta_locs.len(),
         args.limit.map(|l| format!(" (limited to {})", l)).unwrap_or_default()
     );
+
+    // Fetch inode sizes in batch
+    info!("Fetching inode sizes...");
+    let ino_list: Vec<(i32, i64)> = xlmeta_locs
+        .iter()
+        .map(|loc| (loc.device_id, loc.xlmeta_ino))
+        .collect();
+    let size_map = fetch_inode_sizes(&client, &ino_list).await?;
+    info!("Loaded sizes for {} inodes", size_map.len());
+
+    // Update sizes in xlmeta_locs
+    let xlmeta_locs: Vec<XlmetaLocation> = xlmeta_locs
+        .into_iter()
+        .map(|mut loc| {
+            if let Some(&size) = size_map.get(&(loc.device_id, loc.xlmeta_ino)) {
+                loc.size = size;
+            }
+            loc
+        })
+        .collect();
 
     // Phase 2: Read xl.meta files and parse
     info!("Phase 2: Reading and parsing xl.meta files...");
@@ -409,6 +393,50 @@ async fn fetch_extents(
                 .entry((ext.device_id, ext.ino))
                 .or_default()
                 .push(ext);
+        }
+    }
+
+    Ok(result)
+}
+
+async fn fetch_inode_sizes(
+    client: &clickhouse::Client,
+    ino_list: &[(i32, i64)],
+) -> Result<HashMap<(i32, i64), i64>> {
+    let mut result: HashMap<(i32, i64), i64> = HashMap::new();
+
+    const CHUNK_SIZE: usize = 10000;
+    for chunk in ino_list.chunks(CHUNK_SIZE) {
+        let tuples: Vec<String> = chunk
+            .iter()
+            .map(|(dev, ino)| format!("({}, {})", dev, ino))
+            .collect();
+        let in_clause = tuples.join(", ");
+
+        let query = format!(
+            r#"
+            SELECT device_id, ino, size
+            FROM inodes
+            WHERE (device_id, ino) IN ({})
+            "#,
+            in_clause
+        );
+
+        #[derive(clickhouse::Row, Deserialize)]
+        struct InodeSizeRow {
+            device_id: i32,
+            ino: i64,
+            size: i64,
+        }
+
+        let rows: Vec<InodeSizeRow> = client
+            .query(&query)
+            .fetch_all()
+            .await
+            .context("fetch inode sizes")?;
+
+        for row in rows {
+            result.insert((row.device_id, row.ino), row.size);
         }
     }
 
