@@ -252,9 +252,10 @@ async fn run(args: Args) -> Result<()> {
         let meta = match xlmeta::parse(&data) {
             Ok(m) => m,
             Err(e) => {
+                let header: Vec<u8> = data.iter().take(16).copied().collect();
                 warn!(
-                    "Failed to parse xl.meta {}:{}: {}",
-                    loc.bucket, loc.key, e
+                    "Failed to parse xl.meta {}:{}: {} (header: {:02x?}, device={}, ino={}, size={}, extents={:?})",
+                    loc.bucket, loc.key, e, header, loc.device_id, loc.xlmeta_ino, loc.size, mfu_extents
                 );
                 errors += 1;
                 pb.inc(1);
