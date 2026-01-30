@@ -150,9 +150,9 @@ async fn run(args: Args) -> Result<()> {
             SELECT
                 bucket,
                 key,
-                argMin(device_id, device_id) as device_id,
-                argMin(xlmeta_ino, device_id) as xlmeta_ino,
-                argMin(data_dir_ino, device_id) as data_dir_ino
+                any(device_id) as device_id,
+                any(xlmeta_ino) as xlmeta_ino,
+                any(data_dir_ino) as data_dir_ino
             FROM s3_xlmeta_locations
             GROUP BY bucket, key
             {}
