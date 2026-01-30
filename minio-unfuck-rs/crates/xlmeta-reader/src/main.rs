@@ -349,7 +349,7 @@ async fn run(args: Args) -> Result<()> {
     } else {
         // Phase 3: Populate file_shards via SQL
         info!("Phase 3: Populating file_shards table...");
-        populate_file_shards(&client).await?;
+        populate_file_shards(&client, devices.len()).await?;
     }
 
     info!("xlmeta-reader complete");
@@ -457,36 +457,38 @@ async fn insert_objects(client: &clickhouse::Client, objects: &mut Vec<ChObject>
     Ok(())
 }
 
-async fn populate_file_shards(client: &clickhouse::Client) -> Result<()> {
-    // Use SQL to populate file_shards from existing tables
-    // This joins s3_xlmeta_locations with dirs (to find part.* files) and file_extents
-    let query = r#"
-        INSERT INTO file_shards (device_id, bucket, key, part_number, disk_index, shard_ino, physical_offset, total_length)
-        SELECT
-            s.device_id,
-            s.bucket,
-            s.key,
-            toInt32(extractAll(d.name, 'part\.([0-9]+)')[1]) as part_number,
-            0 as disk_index,  -- Will be filled by separate lookup
-            d.child_ino as shard_ino,
-            min(fe.physical_offset) as physical_offset,
-            sum(fe.length) as total_length
-        FROM s3_xlmeta_locations s
-        JOIN dirs d ON d.device_id = s.device_id AND d.parent_ino = s.data_dir_ino
-        JOIN file_extents fe ON fe.device_id = s.device_id AND fe.ino = d.child_ino
-        WHERE d.name LIKE 'part.%'
-        GROUP BY s.device_id, s.bucket, s.key, part_number, shard_ino
-        SETTINGS join_algorithm = 'partial_merge', max_bytes_before_external_group_by = 10000000000
-    "#;
-
-    info!("Running file_shards INSERT query (this may take a while)...");
+async fn populate_file_shards(client: &clickhouse::Client, num_devices: usize) -> Result<()> {
+    // Process one device at a time to avoid OOM on large joins
+    info!("Populating file_shards table ({} devices)...", num_devices);
     let start = Instant::now();
 
-    client
-        .query(query)
-        .execute()
-        .await
-        .context("populate file_shards")?;
+    for device_id in 0..num_devices {
+        let query = format!(r#"
+            INSERT INTO file_shards (device_id, bucket, key, part_number, disk_index, shard_ino, physical_offset, total_length)
+            SELECT
+                s.device_id,
+                s.bucket,
+                s.key,
+                toInt32(extractAll(d.name, 'part\.([0-9]+)')[1]) as part_number,
+                0 as disk_index,
+                d.child_ino as shard_ino,
+                min(fe.physical_offset) as physical_offset,
+                sum(fe.length) as total_length
+            FROM s3_xlmeta_locations s
+            JOIN dirs d ON d.device_id = s.device_id AND d.parent_ino = s.data_dir_ino
+            JOIN file_extents fe ON fe.device_id = s.device_id AND fe.ino = d.child_ino
+            WHERE s.device_id = {} AND d.name LIKE 'part.%'
+            GROUP BY s.device_id, s.bucket, s.key, part_number, shard_ino
+        "#, device_id);
+
+        client
+            .query(&query)
+            .execute()
+            .await
+            .with_context(|| format!("populate file_shards for device {}", device_id))?;
+
+        info!("  Device {}/{} done", device_id + 1, num_devices);
+    }
 
     info!(
         "file_shards populated in {:.1}s",
