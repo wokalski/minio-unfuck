@@ -349,9 +349,10 @@ pub async fn lookup_part_shards(
         .map(|p| format!("'{}'", escape_str(p)))
         .collect();
 
-    // Query 1: Get device_id/ino from fs table (fast with projection)
+    // Query 1: Get device_id/ino from fs table
+    // Uses projection for processed parts, bloom_filter for the rest
     let fs_query = format!(
-        "SELECT device_id, child_ino as ino, name FROM fs WHERE name IN ({}) SETTINGS force_optimize_projection = 1",
+        "SELECT device_id, child_ino as ino, name FROM fs WHERE name IN ({})",
         paths_in.join(", ")
     );
 
