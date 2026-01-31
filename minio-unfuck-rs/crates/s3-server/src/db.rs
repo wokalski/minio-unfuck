@@ -325,8 +325,16 @@ pub struct PartShardInfo {
     pub size: i64,
 }
 
-/// Lookup all shard extents + sizes for given part paths in ONE query
-/// Uses CTEs to pre-filter and avoid expensive full-table JOINs
+/// Inode location from fs table
+#[derive(Debug, Clone, Row, Deserialize)]
+struct FsInode {
+    device_id: i32,
+    ino: i64,
+    name: String,
+}
+
+/// Lookup all shard extents + sizes for given part paths
+/// Uses two queries: first fs lookup (fast with projection), then extents/sizes
 pub async fn lookup_part_shards(
     client: &clickhouse::Client,
     part_paths: &[String],
@@ -341,59 +349,74 @@ pub async fn lookup_part_shards(
         .map(|p| format!("'{}'", escape_str(p)))
         .collect();
 
-    let query = format!(
-        r#"
-        WITH
-            part_inodes AS (
-                SELECT device_id, child_ino as ino, name FROM fs
-                WHERE name IN ({})
-            ),
-            part_extents AS (
-                SELECT device_id, ino, logical_offset, physical_offset, length
-                FROM file_extents
-                WHERE (device_id, ino) IN (SELECT device_id, ino FROM part_inodes)
-            ),
-            part_sizes AS (
-                SELECT device_id, ino, size
-                FROM inodes
-                WHERE (device_id, ino) IN (SELECT device_id, ino FROM part_inodes)
-            )
-        SELECT p.name as name, e.device_id as device_id, e.ino as ino,
-               e.logical_offset as logical_offset, e.physical_offset as physical_offset,
-               e.length as length, s.size as size
-        FROM part_inodes p
-        JOIN part_extents e ON p.device_id = e.device_id AND p.ino = e.ino
-        JOIN part_sizes s ON e.device_id = s.device_id AND e.ino = s.ino
-        ORDER BY name, device_id, logical_offset
-        "#,
+    // Query 1: Get device_id/ino from fs table (fast with projection)
+    let fs_query = format!(
+        "SELECT device_id, child_ino as ino, name FROM fs WHERE name IN ({}) SETTINGS force_optimize_projection = 1",
         paths_in.join(", ")
     );
 
-    #[derive(Debug, Clone, Row, Deserialize)]
-    struct RowWithName {
-        name: String,
-        device_id: i32,
-        ino: i64,
-        logical_offset: i64,
-        physical_offset: i64,
-        length: i64,
-        size: i64,
+    let fs_rows: Vec<FsInode> = client.query(&fs_query).fetch_all().await
+        .map_err(|e| anyhow::anyhow!("lookup fs inodes: {}", e))?;
+
+    if fs_rows.is_empty() {
+        return Ok(HashMap::new());
     }
 
-    let rows: Vec<RowWithName> = client.query(&query).fetch_all().await
-        .map_err(|e| anyhow::anyhow!("lookup part shards: {}", e))?;
+    // Build map from (device_id, ino) -> name for later grouping
+    let mut ino_to_name: HashMap<(i32, i64), String> = HashMap::new();
+    for row in &fs_rows {
+        ino_to_name.insert((row.device_id, row.ino), row.name.clone());
+    }
 
-    // Group by path
+    // Build IN clause for device_id/ino pairs
+    let ino_in: Vec<String> = fs_rows
+        .iter()
+        .map(|r| format!("({}, {})", r.device_id, r.ino))
+        .collect();
+    let ino_in_clause = ino_in.join(", ");
+
+    // Query 2: Get extents and sizes in parallel
+    let extents_query = format!(
+        "SELECT device_id, ino, logical_offset, physical_offset, length FROM file_extents WHERE (device_id, ino) IN ({}) ORDER BY device_id, ino, logical_offset",
+        ino_in_clause
+    );
+    let sizes_query = format!(
+        "SELECT device_id, ino, size FROM inodes WHERE (device_id, ino) IN ({})",
+        ino_in_clause
+    );
+
+    // Run both queries concurrently
+    let (extents_result, sizes_result) = tokio::join!(
+        client.query(&extents_query).fetch_all::<ExtentRow>(),
+        client.query(&sizes_query).fetch_all::<InodeRow>()
+    );
+
+    let extents: Vec<ExtentRow> = extents_result
+        .map_err(|e| anyhow::anyhow!("lookup extents: {}", e))?;
+    let sizes: Vec<InodeRow> = sizes_result
+        .map_err(|e| anyhow::anyhow!("lookup sizes: {}", e))?;
+
+    // Build size map
+    let mut size_map: HashMap<(i32, i64), i64> = HashMap::new();
+    for row in sizes {
+        size_map.insert((row.device_id, row.ino), row.size);
+    }
+
+    // Group extents by path
     let mut result: HashMap<String, Vec<PartShardInfo>> = HashMap::new();
-    for row in rows {
-        result.entry(row.name.clone()).or_default().push(PartShardInfo {
-            device_id: row.device_id,
-            ino: row.ino,
-            logical_offset: row.logical_offset,
-            physical_offset: row.physical_offset,
-            length: row.length,
-            size: row.size,
-        });
+    for ext in extents {
+        let key = (ext.device_id, ext.ino);
+        if let Some(name) = ino_to_name.get(&key) {
+            let size = size_map.get(&key).copied().unwrap_or(0);
+            result.entry(name.clone()).or_default().push(PartShardInfo {
+                device_id: ext.device_id,
+                ino: ext.ino,
+                logical_offset: ext.logical_offset,
+                physical_offset: ext.physical_offset,
+                length: ext.length,
+                size,
+            });
+        }
     }
 
     Ok(result)
