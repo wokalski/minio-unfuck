@@ -53,7 +53,7 @@ pub struct ShardReadPlan {
 }
 
 /// Result of reading a shard
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ShardReadResult {
     pub request_id: u64,
     pub part_number: i32,
