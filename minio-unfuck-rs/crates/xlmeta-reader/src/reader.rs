@@ -59,6 +59,7 @@ fn reader_thread(
     let mut in_flight: HashMap<u64, InFlight> = HashMap::new();
     let mut next_xlmeta_idx: u64 = 0;
     let mut pending_submissions = 0u32;
+    let mut deferred_xlmeta: Option<ReadyXlmeta> = None; // xlmeta waiting for queue space
 
     // I/O stats
     let start_time = Instant::now();
@@ -74,8 +75,11 @@ fn reader_thread(
 
     loop {
         // Receive xlmetas and submit reads
-        while pending_submissions < queue_depth {
-            let xlmeta = if in_flight.is_empty() {
+        loop {
+            // First, try to process any deferred xlmeta
+            let xlmeta = if let Some(deferred) = deferred_xlmeta.take() {
+                deferred
+            } else if in_flight.is_empty() && deferred_xlmeta.is_none() {
                 match ready_rx.recv() {
                     Ok(x) => x,
                     Err(_) => break, // Channel closed
@@ -87,6 +91,23 @@ fn reader_thread(
                     Err(mpsc::TryRecvError::Disconnected) => break,
                 }
             };
+
+            // Check if we have room for ALL extents of this xlmeta
+            let extents_needed = xlmeta.extents.len() as u32;
+            if extents_needed > queue_depth {
+                // File has more extents than queue can ever hold - skip it
+                tracing::warn!(
+                    "xlmeta {}:{} has {} extents, exceeds queue depth {} - skipping",
+                    xlmeta.bucket, xlmeta.key, extents_needed, queue_depth
+                );
+                continue;
+            }
+
+            if pending_submissions + extents_needed > queue_depth {
+                // Not enough room right now - defer this xlmeta for later
+                deferred_xlmeta = Some(xlmeta);
+                break;
+            }
 
             let xlmeta_idx = next_xlmeta_idx;
             next_xlmeta_idx += 1;
@@ -106,7 +127,7 @@ fn reader_thread(
                 unsafe {
                     ring.submission()
                         .push(&read_op)
-                        .map_err(|_| anyhow::anyhow!("SQ full"))?;
+                        .expect("SQ should have room");
                 }
                 pending_submissions += 1;
             }
@@ -121,7 +142,7 @@ fn reader_thread(
             );
         }
 
-        if in_flight.is_empty() && ready_rx.try_recv().is_err() {
+        if in_flight.is_empty() && deferred_xlmeta.is_none() && ready_rx.try_recv().is_err() {
             break;
         }
 
