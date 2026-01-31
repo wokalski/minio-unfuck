@@ -30,8 +30,8 @@ impl TmpXlmetasGuard {
 impl Drop for TmpXlmetasGuard {
     fn drop(&mut self) {
         let client = self.client.clone();
-        // Use block_on to ensure the drop completes
-        let _ = self.runtime_handle.block_on(async {
+        // Spawn cleanup task - don't block since we may be in async context
+        self.runtime_handle.spawn(async move {
             let _ = client
                 .query("DROP TABLE IF EXISTS tmp_xlmetas")
                 .execute()
