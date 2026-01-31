@@ -175,47 +175,50 @@ impl BatchExecutor {
 
         info!("Parts to read: {:?}", parts);
 
-        // For each part, plan reads for each disk in the distribution
+        // For each part, query fs table once to get all device->inode mappings
         for part_number in parts {
-            for (disk_idx, &shard_num) in obj.distribution.iter().enumerate() {
-                // Get device_id for this disk using the correct pool/set
-                let device_id = match self.cluster.disk_index_to_device(pool_idx, set_idx, disk_idx) {
-                    Some(id) => id,
-                    None => {
-                        info!("disk_idx {} has no device mapping (pool={}, set={})", disk_idx, pool_idx, set_idx);
-                        continue;
-                    }
-                };
+            // Build full path: bucket/key/data_dir/part.N
+            let full_path = format!(
+                "{}/{}/{}/part.{}",
+                obj.bucket, obj.key, data_dir, part_number
+            );
+
+            info!("Looking up full path: {}", full_path);
+
+            // Single query to get all devices with this part
+            let locations = db::lookup_part_by_path(&self.client, &full_path).await?;
+
+            info!("Found {} locations for {}", locations.len(), full_path);
+
+            for loc in locations {
+                let device_id = loc.device_id as usize;
+                let ino = loc.child_ino;
 
                 if device_id >= self.device_fds.len() {
-                    debug!("device_id {} >= device_fds.len() {}", device_id, self.device_fds.len());
                     continue;
                 }
 
-                // Look up part file: UUID dir by name, then part.N under it
-                let part_name = format!("part.{}", part_number);
-
-                info!("Looking up {}/{} on device {}", data_dir, part_name, device_id);
-
-                let ino = match db::lookup_part_inode(&self.client, device_id as i32, data_dir, &part_name).await?
-                {
-                    Some(i) => i,
-                    None => {
-                        info!("Part {}/{} not found on device {}", data_dir, part_name, device_id);
-                        continue;
-                    }
+                // Get shard_index from distribution based on device_id
+                // Find which disk_idx this device maps to
+                let disk_idx = match self.cluster.device_position(device_id) {
+                    Some((_, _, idx)) => idx,
+                    None => continue,
                 };
 
-                // Get extents
-                let extents =
-                    db::get_file_extents(&self.client, device_id as i32, ino).await?;
+                // Get shard number from distribution (1-based)
+                let shard_num = obj.distribution.get(disk_idx).copied().unwrap_or(0);
+                if shard_num == 0 {
+                    continue;
+                }
 
+                // Get extents
+                let extents = db::get_file_extents(&self.client, loc.device_id, ino).await?;
                 if extents.is_empty() {
                     continue;
                 }
 
                 // Get file size
-                let size = db::get_inode_size(&self.client, device_id as i32, ino)
+                let size = db::get_inode_size(&self.client, loc.device_id, ino)
                     .await?
                     .unwrap_or(0);
 

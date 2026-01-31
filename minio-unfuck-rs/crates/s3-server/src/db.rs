@@ -305,43 +305,30 @@ pub async fn resolve_dir_entry(
     Ok(rows.first().map(|r| r.child_ino))
 }
 
-/// Look up a directory by name directly (for UUID directories)
-pub async fn lookup_dir_by_name(
-    client: &clickhouse::Client,
-    device_id: i32,
-    name: &str,
-) -> Result<Option<i64>> {
-    let rows: Vec<DirEntry> = client
-        .query(
-            "SELECT device_id, parent_ino, child_ino, name
-             FROM dirs
-             WHERE device_id = ? AND name = ?
-             LIMIT 1",
-        )
-        .bind(device_id)
-        .bind(name)
-        .fetch_all()
-        .await
-        .context("lookup dir by name")?;
-
-    Ok(rows.first().map(|r| r.child_ino))
+/// Part file location from fs table
+#[derive(Debug, Clone, Row, Deserialize)]
+pub struct PartLocation {
+    pub device_id: i32,
+    pub child_ino: i64,
 }
 
-/// Look up part file inode: find UUID dir, then part.N under it
-pub async fn lookup_part_inode(
+/// Look up part file by full path in fs table (fast single query)
+pub async fn lookup_part_by_path(
     client: &clickhouse::Client,
-    device_id: i32,
-    data_dir_uuid: &str,
-    part_name: &str,
-) -> Result<Option<i64>> {
-    // Step 1: Find UUID directory by name
-    let uuid_ino = match lookup_dir_by_name(client, device_id, data_dir_uuid).await? {
-        Some(ino) => ino,
-        None => return Ok(None),
-    };
+    full_path: &str,
+) -> Result<Vec<PartLocation>> {
+    let rows: Vec<PartLocation> = client
+        .query(
+            "SELECT device_id, child_ino
+             FROM fs
+             WHERE name = ?",
+        )
+        .bind(full_path)
+        .fetch_all()
+        .await
+        .context("lookup part by path")?;
 
-    // Step 2: Find part file under UUID directory
-    resolve_dir_entry(client, device_id, uuid_ino, part_name).await
+    Ok(rows)
 }
 
 /// Find format.json file locations on all devices
