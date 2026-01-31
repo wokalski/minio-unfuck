@@ -2,6 +2,8 @@
 //!
 //! Handles object lookups, extent queries, and path resolution.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use clickhouse::Row;
 use mfu_core::types::Extent;
@@ -279,6 +281,92 @@ pub async fn get_inode_size(
         .context("get inode size")?;
 
     Ok(rows.first().map(|r| r.size))
+}
+
+/// Batch get inode sizes for multiple (device_id, ino) pairs
+pub async fn batch_get_inode_sizes(
+    client: &clickhouse::Client,
+    keys: &[(i32, i64)],
+) -> Result<HashMap<(i32, i64), i64>> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let in_clause: Vec<String> = keys
+        .iter()
+        .map(|(d, i)| format!("({}, {})", d, i))
+        .collect();
+
+    let query = format!(
+        "SELECT device_id, ino, size
+         FROM inodes
+         WHERE (device_id, ino) IN ({})",
+        in_clause.join(", ")
+    );
+
+    let rows: Vec<InodeRow> = client.query(&query).fetch_all().await.context("batch get inode sizes")?;
+
+    let mut result: HashMap<(i32, i64), i64> = HashMap::new();
+    for row in rows {
+        result.insert((row.device_id, row.ino), row.size);
+    }
+
+    Ok(result)
+}
+
+/// Combined extent + size lookup in one query (JOIN)
+#[derive(Debug, Clone, Row, Deserialize)]
+pub struct ExtentWithSize {
+    pub device_id: i32,
+    pub ino: i64,
+    pub logical_offset: i64,
+    pub physical_offset: i64,
+    pub length: i64,
+    pub size: i64,
+}
+
+/// Batch get extents and sizes in a single query using JOIN
+pub async fn batch_get_extents_with_sizes(
+    client: &clickhouse::Client,
+    keys: &[(i32, i64)],
+) -> Result<HashMap<(i32, i64), (Vec<Extent>, i64)>> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let in_clause: Vec<String> = keys
+        .iter()
+        .map(|(d, i)| format!("({}, {})", d, i))
+        .collect();
+
+    let query = format!(
+        "SELECT e.device_id, e.ino, e.logical_offset, e.physical_offset, e.length, i.size
+         FROM file_extents e
+         JOIN inodes i ON e.device_id = i.device_id AND e.ino = i.ino
+         WHERE (e.device_id, e.ino) IN ({})
+         ORDER BY e.device_id, e.ino, e.logical_offset",
+        in_clause.join(", ")
+    );
+
+    let rows: Vec<ExtentWithSize> = client.query(&query).fetch_all().await.context("batch get extents with sizes")?;
+
+    // Group by (device_id, ino)
+    let mut result: HashMap<(i32, i64), (Vec<Extent>, i64)> = HashMap::new();
+
+    for row in rows {
+        let key = (row.device_id, row.ino);
+        let extent = Extent {
+            logical_offset: row.logical_offset,
+            physical_offset: row.physical_offset,
+            length: row.length,
+        };
+
+        result.entry(key)
+            .or_insert_with(|| (Vec::new(), row.size))
+            .0.push(extent);
+    }
+
+    Ok(result)
 }
 
 /// Resolve a directory entry by parent inode and name

@@ -175,69 +175,82 @@ impl BatchExecutor {
 
         info!("Parts to read: {:?}", parts);
 
-        // For each part, query fs table once to get all device->inode mappings
+        // Step 1: Collect all (part_number, device_id, ino, disk_idx) from fs lookups
+        struct PartLocation {
+            part_number: i32,
+            device_id: usize,
+            ino: i64,
+            disk_idx: usize,
+        }
+        let mut part_locations: Vec<PartLocation> = Vec::new();
+
         for part_number in parts {
-            // Build full path: bucket/key/data_dir/part.N
             let full_path = format!(
                 "{}/{}/{}/part.{}",
                 obj.bucket, obj.key, data_dir, part_number
             );
 
-            info!("Looking up full path: {}", full_path);
-
-            // Single query to get all devices with this part
             let locations = db::lookup_part_by_path(&self.client, &full_path).await?;
 
-            info!("Found {} locations for {}", locations.len(), full_path);
+            debug!("Found {} locations for {}", locations.len(), full_path);
 
             for loc in locations {
                 let device_id = loc.device_id as usize;
-                let ino = loc.child_ino;
-
                 if device_id >= self.device_fds.len() {
                     continue;
                 }
 
-                // Get shard_index from distribution based on device_id
-                // Find which disk_idx this device maps to
                 let disk_idx = match self.cluster.device_position(device_id) {
                     Some((_, _, idx)) => idx,
                     None => continue,
                 };
 
-                // Verify this disk has a valid distribution entry
                 let shard_num = obj.distribution.get(disk_idx).copied().unwrap_or(0);
                 if shard_num == 0 {
                     continue;
                 }
 
-                // Get extents
-                let extents = db::get_file_extents(&self.client, loc.device_id, ino).await?;
-                if extents.is_empty() {
-                    continue;
-                }
-
-                // Get file size
-                let size = db::get_inode_size(&self.client, loc.device_id, ino)
-                    .await?
-                    .unwrap_or(0);
-
-                if size == 0 {
-                    continue;
-                }
-
-                let first_phys_offset = extents.first().map(|e| e.physical_offset).unwrap_or(0);
-
-                plans.push(ShardReadPlan {
-                    request_id,
+                part_locations.push(PartLocation {
                     part_number,
-                    disk_index: disk_idx, // Position in distribution array (0..15)
                     device_id,
-                    extents,
-                    file_size: size as u64,
-                    first_phys_offset,
+                    ino: loc.child_ino,
+                    disk_idx,
                 });
             }
+        }
+
+        if part_locations.is_empty() {
+            return Ok(plans);
+        }
+
+        // Step 2: Batch lookup extents and sizes in ONE query (JOIN)
+        let inode_keys: Vec<(i32, i64)> = part_locations
+            .iter()
+            .map(|p| (p.device_id as i32, p.ino))
+            .collect();
+
+        let extents_with_sizes = db::batch_get_extents_with_sizes(&self.client, &inode_keys).await?;
+
+        // Step 3: Build plans using collected data
+        for loc in part_locations {
+            let key = (loc.device_id as i32, loc.ino);
+
+            let (extents, size) = match extents_with_sizes.get(&key) {
+                Some((e, s)) if !e.is_empty() && *s > 0 => (e.clone(), *s),
+                _ => continue,
+            };
+
+            let first_phys_offset = extents.first().map(|e| e.physical_offset).unwrap_or(0);
+
+            plans.push(ShardReadPlan {
+                request_id,
+                part_number: loc.part_number,
+                disk_index: loc.disk_idx,
+                device_id: loc.device_id,
+                extents,
+                file_size: size as u64,
+                first_phys_offset,
+            });
         }
 
         Ok(plans)
