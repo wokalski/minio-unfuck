@@ -305,26 +305,43 @@ pub async fn resolve_dir_entry(
     Ok(rows.first().map(|r| r.child_ino))
 }
 
-/// Resolve a path to inode (e.g., "/bucket/key/data_dir/part.1")
-pub async fn resolve_path(
+/// Look up a directory by name directly (for UUID directories)
+pub async fn lookup_dir_by_name(
     client: &clickhouse::Client,
     device_id: i32,
-    path: &str,
+    name: &str,
 ) -> Result<Option<i64>> {
-    // XFS root inode is always 128
-    let root_ino: i64 = 128;
+    let rows: Vec<DirEntry> = client
+        .query(
+            "SELECT device_id, parent_ino, child_ino, name
+             FROM dirs
+             WHERE device_id = ? AND name = ?
+             LIMIT 1",
+        )
+        .bind(device_id)
+        .bind(name)
+        .fetch_all()
+        .await
+        .context("lookup dir by name")?;
 
-    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let mut current_ino = root_ino;
+    Ok(rows.first().map(|r| r.child_ino))
+}
 
-    for component in components {
-        match resolve_dir_entry(client, device_id, current_ino, component).await? {
-            Some(ino) => current_ino = ino,
-            None => return Ok(None),
-        }
-    }
+/// Look up part file inode: find UUID dir, then part.N under it
+pub async fn lookup_part_inode(
+    client: &clickhouse::Client,
+    device_id: i32,
+    data_dir_uuid: &str,
+    part_name: &str,
+) -> Result<Option<i64>> {
+    // Step 1: Find UUID directory by name
+    let uuid_ino = match lookup_dir_by_name(client, device_id, data_dir_uuid).await? {
+        Some(ino) => ino,
+        None => return Ok(None),
+    };
 
-    Ok(Some(current_ino))
+    // Step 2: Find part file under UUID directory
+    resolve_dir_entry(client, device_id, uuid_ino, part_name).await
 }
 
 /// Find format.json file locations on all devices

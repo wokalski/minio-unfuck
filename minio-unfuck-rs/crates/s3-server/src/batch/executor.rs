@@ -192,19 +192,16 @@ impl BatchExecutor {
                     continue;
                 }
 
-                // Resolve shard path to inode
-                let shard_path = format!(
-                    "{}/{}/{}/part.{}",
-                    obj.bucket, obj.key, data_dir, part_number
-                );
+                // Look up part file: UUID dir by name, then part.N under it
+                let part_name = format!("part.{}", part_number);
 
-                info!("Resolving path {} on device {}", shard_path, device_id);
+                info!("Looking up {}/{} on device {}", data_dir, part_name, device_id);
 
-                let ino = match db::resolve_path(&self.client, device_id as i32, &shard_path).await?
+                let ino = match db::lookup_part_inode(&self.client, device_id as i32, data_dir, &part_name).await?
                 {
                     Some(i) => i,
                     None => {
-                        info!("Path {} not found on device {}", shard_path, device_id);
+                        info!("Part {}/{} not found on device {}", data_dir, part_name, device_id);
                         continue;
                     }
                 };
