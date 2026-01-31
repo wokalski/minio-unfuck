@@ -47,7 +47,7 @@ impl BatchedReader {
                 results.push(ShardReadResult {
                     request_id: plan.request_id,
                     part_number: plan.part_number,
-                    shard_index: plan.shard_index,
+                    disk_index: plan.disk_index,
                     data: None,
                 });
                 continue;
@@ -85,7 +85,7 @@ impl BatchedReader {
             results.push(ShardReadResult {
                 request_id: plan.request_id,
                 part_number: plan.part_number,
-                shard_index: plan.shard_index,
+                disk_index: plan.disk_index,
                 data: if read_ok { Some(buffer) } else { None },
             });
         }
@@ -128,7 +128,7 @@ pub mod uring {
                     all_results.push(ShardReadResult {
                         request_id: plan.request_id,
                         part_number: plan.part_number,
-                        shard_index: plan.shard_index,
+                        disk_index: plan.disk_index,
                         data: None,
                     });
                 }
@@ -176,7 +176,7 @@ pub mod uring {
                     results[plan_idx] = Some(ShardReadResult {
                         request_id: plan.request_id,
                         part_number: plan.part_number,
-                        shard_index: plan.shard_index,
+                        disk_index: plan.disk_index,
                         data: None,
                     });
                     continue;
@@ -243,7 +243,7 @@ pub mod uring {
                         results[inf.plan_idx] = Some(ShardReadResult {
                             request_id: plan.request_id,
                             part_number: plan.part_number,
-                            shard_index: plan.shard_index,
+                            disk_index: plan.disk_index,
                             data: None,
                         });
                     }
@@ -259,7 +259,7 @@ pub mod uring {
                         results[inf.plan_idx] = Some(ShardReadResult {
                             request_id: plan.request_id,
                             part_number: plan.part_number,
-                            shard_index: plan.shard_index,
+                            disk_index: plan.disk_index,
                             data: Some(inf.buffer),
                         });
                     }
@@ -277,7 +277,7 @@ pub mod uring {
                     ShardReadResult {
                         request_id: plan.request_id,
                         part_number: plan.part_number,
-                        shard_index: plan.shard_index,
+                        disk_index: plan.disk_index,
                         data: None,
                     }
                 })

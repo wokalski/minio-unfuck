@@ -205,7 +205,7 @@ impl BatchExecutor {
                     None => continue,
                 };
 
-                // Get shard number from distribution (1-based)
+                // Verify this disk has a valid distribution entry
                 let shard_num = obj.distribution.get(disk_idx).copied().unwrap_or(0);
                 if shard_num == 0 {
                     continue;
@@ -231,7 +231,7 @@ impl BatchExecutor {
                 plans.push(ShardReadPlan {
                     request_id,
                     part_number,
-                    shard_index: (shard_num - 1) as usize, // Convert 1-based to 0-based
+                    disk_index: disk_idx, // Position in distribution array (0..15)
                     device_id,
                     extents,
                     file_size: size as u64,
@@ -252,7 +252,7 @@ impl BatchExecutor {
             results.push(ShardReadResult {
                 request_id: plan.request_id,
                 part_number: plan.part_number,
-                shard_index: plan.shard_index,
+                disk_index: plan.disk_index,
                 data,
             });
         }
@@ -338,9 +338,9 @@ impl<'a> erasure::ShardReader for ResultShardReader<'a> {
         _data_dir: &str,
         part_number: i32,
     ) -> anyhow::Result<Option<Vec<u8>>> {
-        // Find the matching result
+        // Find the matching result by disk_index (position in distribution array)
         for result in self.results {
-            if result.shard_index == disk_index && result.part_number == part_number {
+            if result.disk_index == disk_index && result.part_number == part_number {
                 return Ok(result.data.clone());
             }
         }

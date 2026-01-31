@@ -40,8 +40,9 @@ pub struct ShardReadPlan {
     pub request_id: u64,
     /// Part number (1-based)
     pub part_number: i32,
-    /// Shard index within the part (0-based, for erasure)
-    pub shard_index: usize,
+    /// Disk index within the erasure set (0-based, 0..15 for 16-disk set)
+    /// This is the position in the distribution array, NOT the erasure shard index
+    pub disk_index: usize,
     /// Device to read from
     pub device_id: usize,
     /// Extents to read
@@ -57,7 +58,8 @@ pub struct ShardReadPlan {
 pub struct ShardReadResult {
     pub request_id: u64,
     pub part_number: i32,
-    pub shard_index: usize,
+    /// Disk index within the erasure set (0-based, 0..15 for 16-disk set)
+    pub disk_index: usize,
     pub data: Option<Vec<u8>>,
 }
 
