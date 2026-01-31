@@ -94,6 +94,12 @@ impl BatchExecutor {
         }
 
         if all_shard_plans.is_empty() {
+            debug!("No shard plans found, sending errors to {} pending requests", object_plans.len());
+            for (_, plan) in object_plans {
+                let _ = plan.response_tx.send(Err(BatchError::Internal(
+                    "No shards could be read".to_string(),
+                )));
+            }
             return;
         }
 
@@ -145,6 +151,11 @@ impl BatchExecutor {
         // Parse data_dir UUID
         let data_dir = &obj.data_dir;
 
+        debug!(
+            "Planning shard reads for {}/{}, data_dir={}, distribution={:?}",
+            obj.bucket, obj.key, data_dir, obj.distribution
+        );
+
         // Parse parts JSON to get part numbers
         let parts: Vec<i32> = if obj.parts_json.is_empty() {
             vec![1] // Single-part object
@@ -156,6 +167,8 @@ impl BatchExecutor {
                 .collect()
         };
 
+        debug!("Parts to read: {:?}", parts);
+
         // For each part, plan reads for each disk in the distribution
         for part_number in parts {
             for (disk_idx, &shard_num) in obj.distribution.iter().enumerate() {
@@ -163,10 +176,14 @@ impl BatchExecutor {
                 // TODO: Need pool_index and set_index from object metadata
                 let device_id = match self.cluster.disk_index_to_device(0, 0, disk_idx) {
                     Some(id) => id,
-                    None => continue,
+                    None => {
+                        debug!("disk_idx {} has no device mapping", disk_idx);
+                        continue;
+                    }
                 };
 
                 if device_id >= self.device_fds.len() {
+                    debug!("device_id {} >= device_fds.len() {}", device_id, self.device_fds.len());
                     continue;
                 }
 
@@ -176,10 +193,15 @@ impl BatchExecutor {
                     obj.bucket, obj.key, data_dir, part_number
                 );
 
+                debug!("Resolving path {} on device {}", shard_path, device_id);
+
                 let ino = match db::resolve_path(&self.client, device_id as i32, &shard_path).await?
                 {
                     Some(i) => i,
-                    None => continue,
+                    None => {
+                        debug!("Path {} not found on device {}", shard_path, device_id);
+                        continue;
+                    }
                 };
 
                 // Get extents
