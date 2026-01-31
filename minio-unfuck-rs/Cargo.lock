@@ -4423,6 +4423,7 @@ dependencies = [
  "mfu-core",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
