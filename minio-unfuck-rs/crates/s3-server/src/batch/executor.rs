@@ -157,7 +157,7 @@ impl BatchExecutor {
             .device_position(obj.xlmeta_device_id as usize)
             .unwrap_or((0, 0, 0));
 
-        debug!(
+        info!(
             "Planning shard reads for {}/{}, data_dir={}, distribution={:?}, xlmeta_device={}, pool={}, set={}",
             obj.bucket, obj.key, data_dir, obj.distribution, obj.xlmeta_device_id, pool_idx, set_idx
         );
@@ -173,7 +173,7 @@ impl BatchExecutor {
                 .collect()
         };
 
-        debug!("Parts to read: {:?}", parts);
+        info!("Parts to read: {:?}", parts);
 
         // For each part, plan reads for each disk in the distribution
         for part_number in parts {
@@ -182,7 +182,7 @@ impl BatchExecutor {
                 let device_id = match self.cluster.disk_index_to_device(pool_idx, set_idx, disk_idx) {
                     Some(id) => id,
                     None => {
-                        debug!("disk_idx {} has no device mapping (pool={}, set={})", disk_idx, pool_idx, set_idx);
+                        info!("disk_idx {} has no device mapping (pool={}, set={})", disk_idx, pool_idx, set_idx);
                         continue;
                     }
                 };
@@ -198,13 +198,13 @@ impl BatchExecutor {
                     obj.bucket, obj.key, data_dir, part_number
                 );
 
-                debug!("Resolving path {} on device {}", shard_path, device_id);
+                info!("Resolving path {} on device {}", shard_path, device_id);
 
                 let ino = match db::resolve_path(&self.client, device_id as i32, &shard_path).await?
                 {
                     Some(i) => i,
                     None => {
-                        debug!("Path {} not found on device {}", shard_path, device_id);
+                        info!("Path {} not found on device {}", shard_path, device_id);
                         continue;
                     }
                 };
