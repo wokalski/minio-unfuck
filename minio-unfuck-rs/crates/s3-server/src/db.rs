@@ -358,11 +358,13 @@ pub async fn lookup_part_shards(
                 FROM inodes
                 WHERE (device_id, ino) IN (SELECT device_id, ino FROM part_inodes)
             )
-        SELECT p.name, e.device_id, e.ino, e.logical_offset, e.physical_offset, e.length, s.size
+        SELECT p.name as name, e.device_id as device_id, e.ino as ino,
+               e.logical_offset as logical_offset, e.physical_offset as physical_offset,
+               e.length as length, s.size as size
         FROM part_inodes p
         JOIN part_extents e ON p.device_id = e.device_id AND p.ino = e.ino
         JOIN part_sizes s ON e.device_id = s.device_id AND e.ino = s.ino
-        ORDER BY p.name, e.device_id, e.logical_offset
+        ORDER BY name, device_id, logical_offset
         "#,
         paths_in.join(", ")
     );
