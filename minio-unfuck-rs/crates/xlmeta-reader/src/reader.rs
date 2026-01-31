@@ -6,6 +6,7 @@
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::parser::parse_xlmeta;
 use crate::types::{ReadyXlmeta, ReaderResult};
@@ -17,7 +18,7 @@ use crate::types::{ReadyXlmeta, ReaderResult};
 pub fn spawn_reader_thread(
     device_path: String,
     ready_rx: mpsc::Receiver<ReadyXlmeta>,
-    result_tx: mpsc::SyncSender<ReaderResult>,
+    result_tx: tokio_mpsc::Sender<ReaderResult>,
     queue_depth: u32,
 ) -> std::thread::JoinHandle<Result<()>> {
     std::thread::spawn(move || reader_thread(device_path, ready_rx, result_tx, queue_depth))
@@ -31,7 +32,7 @@ pub fn spawn_reader_thread(
 fn reader_thread(
     device_path: String,
     ready_rx: mpsc::Receiver<ReadyXlmeta>,
-    result_tx: mpsc::SyncSender<ReaderResult>,
+    result_tx: tokio_mpsc::Sender<ReaderResult>,
     queue_depth: u32,
 ) -> Result<()> {
     use io_uring::{opcode, types, IoUring};
@@ -135,7 +136,7 @@ fn reader_thread(
             let bytes_read = cqe.result();
             if bytes_read < 0 {
                 if let Some(inf) = in_flight.remove(&xlmeta_idx) {
-                    let _ = result_tx.send(ReaderResult::Error {
+                    let _ = result_tx.blocking_send(ReaderResult::Error {
                         bucket: inf.xlmeta.bucket,
                         key: inf.xlmeta.key,
                         error: format!("read error: {}", bytes_read),
@@ -156,7 +157,7 @@ fn reader_thread(
                 if inf.extents_done == inf.xlmeta.extents.len() {
                     let inf = in_flight.remove(&xlmeta_idx).unwrap();
                     let result = parse_xlmeta(&inf.buffer, &inf.xlmeta);
-                    if result_tx.send(result).is_err() {
+                    if result_tx.blocking_send(result).is_err() {
                         return Ok(()); // Consumer gone
                     }
                     total_files_completed += 1;
@@ -203,7 +204,7 @@ fn reader_thread(
 fn reader_thread(
     device_path: String,
     ready_rx: mpsc::Receiver<ReadyXlmeta>,
-    result_tx: mpsc::SyncSender<ReaderResult>,
+    result_tx: tokio_mpsc::Sender<ReaderResult>,
     _queue_depth: u32,
 ) -> Result<()> {
     use std::fs::File;
@@ -261,7 +262,7 @@ fn reader_thread(
             parse_xlmeta(&buffer, &xlmeta)
         };
 
-        if result_tx.send(result).is_err() {
+        if result_tx.blocking_send(result).is_err() {
             break; // Consumer gone
         }
 
@@ -314,7 +315,7 @@ mod tests {
         temp_file.flush().unwrap();
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(10);
-        let (result_tx, result_rx) = mpsc::sync_channel(10);
+        let (result_tx, mut result_rx) = tokio_mpsc::channel(10);
 
         let path = temp_file.path().to_string_lossy().to_string();
         let handle = spawn_reader_thread(path, ready_rx, result_tx, 16);
@@ -337,7 +338,7 @@ mod tests {
         drop(ready_tx); // Signal end
 
         // Get result (will be an error since test data isn't valid xl.meta)
-        let result = result_rx.recv().unwrap();
+        let result = result_rx.blocking_recv().unwrap();
         match result {
             ReaderResult::Error { bucket, key, .. } => {
                 assert_eq!(bucket, "test");

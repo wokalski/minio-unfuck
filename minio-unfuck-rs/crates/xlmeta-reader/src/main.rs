@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -119,9 +120,12 @@ async fn run(args: Args) -> Result<()> {
         );
 
         // Set up channels for producer-consumer pattern
+        // ready channel: std::mpsc (producer task -> reader OS thread)
+        // result channel: tokio::mpsc (reader OS thread -> consumer async loop)
         let (ready_tx, ready_rx) =
             mpsc::sync_channel::<ReadyXlmeta>(args.queue_depth as usize * 2);
-        let (result_tx, result_rx) = mpsc::sync_channel::<ReaderResult>(args.batch_size);
+        let (result_tx, mut result_rx) =
+            tokio_mpsc::channel::<ReaderResult>(args.batch_size);
 
         // Spawn reader thread (io_uring on Linux, pread on other platforms)
         let device_path = devices[device_id as usize].clone();
@@ -212,7 +216,8 @@ async fn run(args: Args) -> Result<()> {
         let mut objects_count = 0u64;
         let mut errors = 0u64;
 
-        for result in result_rx {
+        // Use async recv to allow producer task to run concurrently
+        while let Some(result) = result_rx.recv().await {
             match result {
                 ReaderResult::Parsed(obj) => {
                     objects_batch.push(obj);
