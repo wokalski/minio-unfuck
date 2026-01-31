@@ -74,7 +74,7 @@ fn main() -> Result<()> {
         args.clickhouse_url, args.clickhouse_db
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
