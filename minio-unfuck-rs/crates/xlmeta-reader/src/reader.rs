@@ -38,6 +38,8 @@ fn reader_thread(
     use std::collections::HashMap;
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
+    use std::time::Instant;
+    use tracing::info;
 
     let file = OpenOptions::new()
         .read(true)
@@ -56,6 +58,18 @@ fn reader_thread(
     let mut in_flight: HashMap<u64, InFlight> = HashMap::new();
     let mut next_xlmeta_idx: u64 = 0;
     let mut pending_submissions = 0u32;
+
+    // I/O stats
+    let start_time = Instant::now();
+    let mut last_log_time = Instant::now();
+    let mut total_bytes_read: u64 = 0;
+    let mut total_read_ops: u64 = 0;
+    let mut total_files_completed: u64 = 0;
+    let mut bytes_since_last_log: u64 = 0;
+    let mut ops_since_last_log: u64 = 0;
+    let mut files_since_last_log: u64 = 0;
+
+    info!("io_uring reader started for {}", device_path);
 
     loop {
         // Receive xlmetas and submit reads
@@ -118,16 +132,23 @@ fn reader_thread(
             let user_data = cqe.user_data();
             let xlmeta_idx = user_data >> 32;
 
-            if cqe.result() < 0 {
+            let bytes_read = cqe.result();
+            if bytes_read < 0 {
                 if let Some(inf) = in_flight.remove(&xlmeta_idx) {
                     let _ = result_tx.send(ReaderResult::Error {
                         bucket: inf.xlmeta.bucket,
                         key: inf.xlmeta.key,
-                        error: format!("read error: {}", cqe.result()),
+                        error: format!("read error: {}", bytes_read),
                     });
                 }
                 continue;
             }
+
+            // Track I/O stats
+            total_bytes_read += bytes_read as u64;
+            bytes_since_last_log += bytes_read as u64;
+            total_read_ops += 1;
+            ops_since_last_log += 1;
 
             if let Some(inf) = in_flight.get_mut(&xlmeta_idx) {
                 inf.extents_done += 1;
@@ -138,10 +159,38 @@ fn reader_thread(
                     if result_tx.send(result).is_err() {
                         return Ok(()); // Consumer gone
                     }
+                    total_files_completed += 1;
+                    files_since_last_log += 1;
                 }
             }
         }
+
+        // Log stats every 5 seconds
+        if last_log_time.elapsed().as_secs() >= 5 {
+            let elapsed = last_log_time.elapsed().as_secs_f64();
+            let mb_per_sec = (bytes_since_last_log as f64 / 1024.0 / 1024.0) / elapsed;
+            let iops = ops_since_last_log as f64 / elapsed;
+            let files_per_sec = files_since_last_log as f64 / elapsed;
+
+            info!(
+                "I/O stats: {:.1} MB/s, {:.0} IOPS, {:.0} files/s | in_flight: {}, pending_sq: {}",
+                mb_per_sec, iops, files_per_sec, in_flight.len(), pending_submissions
+            );
+
+            last_log_time = Instant::now();
+            bytes_since_last_log = 0;
+            ops_since_last_log = 0;
+            files_since_last_log = 0;
+        }
     }
+
+    // Final stats
+    let total_elapsed = start_time.elapsed().as_secs_f64();
+    let total_mb = total_bytes_read as f64 / 1024.0 / 1024.0;
+    info!(
+        "io_uring reader finished: {:.1} MB in {:.1}s ({:.1} MB/s), {} files, {} read ops",
+        total_mb, total_elapsed, total_mb / total_elapsed, total_files_completed, total_read_ops
+    );
 
     Ok(())
 }
@@ -159,9 +208,23 @@ fn reader_thread(
 ) -> Result<()> {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
+    use std::time::Instant;
+    use tracing::info;
 
     let mut file =
         File::open(&device_path).with_context(|| format!("open device {}", device_path))?;
+
+    // I/O stats
+    let start_time = Instant::now();
+    let mut last_log_time = Instant::now();
+    let mut total_bytes_read: u64 = 0;
+    let mut total_read_ops: u64 = 0;
+    let mut total_files_completed: u64 = 0;
+    let mut bytes_since_last_log: u64 = 0;
+    let mut ops_since_last_log: u64 = 0;
+    let mut files_since_last_log: u64 = 0;
+
+    info!("pread reader started for {}", device_path);
 
     for xlmeta in ready_rx {
         let mut buffer = vec![0u8; xlmeta.file_size as usize];
@@ -179,6 +242,13 @@ fn reader_thread(
                 read_error = Some(format!("read error: {}", e));
                 break;
             }
+
+            // Track I/O stats
+            let bytes = extent.length as u64;
+            total_bytes_read += bytes;
+            bytes_since_last_log += bytes;
+            total_read_ops += 1;
+            ops_since_last_log += 1;
         }
 
         let result = if let Some(err) = read_error {
@@ -194,7 +264,36 @@ fn reader_thread(
         if result_tx.send(result).is_err() {
             break; // Consumer gone
         }
+
+        total_files_completed += 1;
+        files_since_last_log += 1;
+
+        // Log stats every 5 seconds
+        if last_log_time.elapsed().as_secs() >= 5 {
+            let elapsed = last_log_time.elapsed().as_secs_f64();
+            let mb_per_sec = (bytes_since_last_log as f64 / 1024.0 / 1024.0) / elapsed;
+            let iops = ops_since_last_log as f64 / elapsed;
+            let files_per_sec = files_since_last_log as f64 / elapsed;
+
+            info!(
+                "I/O stats: {:.1} MB/s, {:.0} IOPS, {:.0} files/s",
+                mb_per_sec, iops, files_per_sec
+            );
+
+            last_log_time = Instant::now();
+            bytes_since_last_log = 0;
+            ops_since_last_log = 0;
+            files_since_last_log = 0;
+        }
     }
+
+    // Final stats
+    let total_elapsed = start_time.elapsed().as_secs_f64();
+    let total_mb = total_bytes_read as f64 / 1024.0 / 1024.0;
+    info!(
+        "pread reader finished: {:.1} MB in {:.1}s ({:.1} MB/s), {} files, {} read ops",
+        total_mb, total_elapsed, total_mb / total_elapsed, total_files_completed, total_read_ops
+    );
 
     Ok(())
 }
