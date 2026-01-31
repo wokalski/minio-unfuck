@@ -217,7 +217,14 @@ fn read_file_sync(device_path: &str, extents: &[Extent], size: u64) -> Result<Ve
     let mut file = File::open(device_path)
         .with_context(|| format!("open device {}", device_path))?;
 
-    let mut buffer = vec![0u8; size as usize];
+    // Calculate buffer size as max of inode size and extent coverage
+    let extent_coverage = extents
+        .iter()
+        .map(|e| (e.logical_offset + e.length) as u64)
+        .max()
+        .unwrap_or(0);
+    let buffer_size = std::cmp::max(size, extent_coverage) as usize;
+    let mut buffer = vec![0u8; buffer_size];
 
     for extent in extents {
         file.seek(SeekFrom::Start(extent.physical_offset as u64))
@@ -229,5 +236,7 @@ fn read_file_sync(device_path: &str, extents: &[Extent], size: u64) -> Result<Ve
             .with_context(|| format!("read extent at offset {}", extent.physical_offset))?;
     }
 
+    // Truncate to actual file size
+    buffer.truncate(size as usize);
     Ok(buffer)
 }
