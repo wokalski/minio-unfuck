@@ -15,7 +15,12 @@ hyper-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
-duckdb = { workspace = true }
+serde = { workspace = true }
+clickhouse = { workspace = true }
 time = "0.3"
 mime = "0.3"
 async-trait = "0.1"
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }
