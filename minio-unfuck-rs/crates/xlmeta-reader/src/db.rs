@@ -34,6 +34,10 @@ impl Drop for TmpXlmetasGuard {
                 .query("DROP TABLE IF EXISTS tmp_xlmetas")
                 .execute()
                 .await;
+            let _ = client
+                .query("DROP TABLE IF EXISTS tmp_xlmetas_all")
+                .execute()
+                .await;
         });
     }
 }
@@ -72,6 +76,10 @@ pub async fn create_objects_table(client: &clickhouse::Client) -> Result<()> {
 /// Creates a temporary table with xlmeta locations for a specific device.
 /// Skips objects that already exist in the objects table.
 /// Returns a guard that will automatically drop the table when it goes out of scope.
+///
+/// This is done in two steps to avoid memory issues:
+/// 1. Create tmp_xlmetas_all with DISTINCT ON (no filtering)
+/// 2. Create tmp_xlmetas by filtering out existing objects
 pub async fn create_tmp_xlmetas(
     client: Arc<clickhouse::Client>,
     device_id: i32,
@@ -79,15 +87,23 @@ pub async fn create_tmp_xlmetas(
 ) -> Result<TmpXlmetasGuard> {
     let limit_clause = limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
 
+    // Clean up any leftover tables
     client
         .query("DROP TABLE IF EXISTS tmp_xlmetas")
         .execute()
         .await
         .context("drop tmp_xlmetas")?;
 
-    let create_tmp = format!(
+    client
+        .query("DROP TABLE IF EXISTS tmp_xlmetas_all")
+        .execute()
+        .await
+        .context("drop tmp_xlmetas_all")?;
+
+    // Step 1: Create temp table with distinct xlmeta locations (no filtering yet)
+    let create_all = format!(
         r#"
-        CREATE TABLE tmp_xlmetas ENGINE = Memory AS
+        CREATE TABLE tmp_xlmetas_all ENGINE = Memory AS
         SELECT DISTINCT ON (bucket, key)
             toValidUTF8(bucket) as bucket,
             toValidUTF8(key) as key,
@@ -96,21 +112,39 @@ pub async fn create_tmp_xlmetas(
             data_dir_ino
         FROM s3_xlmeta_locations s
         WHERE s.device_id = {}
-        AND NOT EXISTS (
-            SELECT 1 FROM objects o
-            WHERE o.bucket = toValidUTF8(s.bucket)
-            AND o.key = toValidUTF8(s.key)
-        )
         {}
         "#,
         device_id, limit_clause
     );
 
     client
-        .query(&create_tmp)
+        .query(&create_all)
         .execute()
         .await
-        .context("create tmp_xlmetas")?;
+        .context("create tmp_xlmetas_all")?;
+
+    // Step 2: Create final table excluding objects that already exist
+    let create_filtered = r#"
+        CREATE TABLE tmp_xlmetas ENGINE = Memory AS
+        SELECT t.*
+        FROM tmp_xlmetas_all t
+        WHERE (t.bucket, t.key) NOT IN (
+            SELECT bucket, key FROM objects
+        )
+    "#;
+
+    client
+        .query(create_filtered)
+        .execute()
+        .await
+        .context("create tmp_xlmetas filtered")?;
+
+    // Clean up intermediate table
+    client
+        .query("DROP TABLE IF EXISTS tmp_xlmetas_all")
+        .execute()
+        .await
+        .context("drop tmp_xlmetas_all")?;
 
     let count: u64 = client
         .query("SELECT count() FROM tmp_xlmetas")
