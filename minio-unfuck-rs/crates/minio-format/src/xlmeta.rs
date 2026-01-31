@@ -707,6 +707,27 @@ fn is_bin_marker(m: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn testdata_path(name: &str) -> PathBuf {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("testdata");
+        path.push(name);
+        path
+    }
+
+    fn read_fixture(name: &str) -> Vec<u8> {
+        let path = testdata_path(name);
+        std::fs::read(&path).unwrap_or_else(|e| {
+            panic!(
+                "Test fixture not found at {:?}. Error: {}. \
+                 Run the fixture download script or check testdata/README.md",
+                path, e
+            )
+        })
+    }
+
+    // ==================== Header validation tests ====================
 
     #[test]
     fn test_parse_rejects_too_short() {
@@ -737,5 +758,234 @@ mod tests {
         let result = parse(data);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("1.2"));
+    }
+
+    // ==================== Integration tests with real fixtures ====================
+
+    /// Test parsing xl.meta from xlmeta/ directory.
+    /// This fixture may be in an older format (version < 1.3) which is expected to fail.
+    #[test]
+    fn test_parse_basic_xlmeta_fixture() {
+        let data = read_fixture("xlmeta/xl.meta");
+
+        // Verify header magic
+        assert!(data.len() >= 8, "xl.meta should be at least 8 bytes");
+        assert_eq!(&data[0..4], b"XL2 ", "should have XL2 header");
+
+        // This fixture is known to be in an older format (version 0x20 0x31 = "1 " ASCII)
+        // which gets interpreted as major version 0x2031 = 8241
+        let result = parse(&data);
+        assert!(result.is_err(), "old format xl.meta should fail to parse");
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("version") || err_str.contains("8241"),
+            "error should mention version issue: {}",
+            err_str
+        );
+    }
+
+    /// Test parsing xl-many-parts.meta which has 9016 parts.
+    /// Expected values:
+    /// - data_blocks (EcM): 12
+    /// - parity_blocks (EcN): 4
+    /// - block_size: 1048576 (1 MiB)
+    /// - distribution: [2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,1]
+    /// - ec_index: 2
+    /// - parts: 9016
+    #[test]
+    fn test_parse_many_parts_xlmeta_fixture() {
+        let data = read_fixture("xlmeta/xl-many-parts.meta");
+        let meta = parse(&data).expect("failed to parse xl-many-parts.meta");
+
+        // Erasure coding parameters
+        assert_eq!(meta.data_blocks, 12, "EcM should be 12");
+        assert_eq!(meta.parity_blocks, 4, "EcN should be 4");
+        assert_eq!(meta.block_size, 1048576, "EcBSize should be 1 MiB");
+        assert_eq!(meta.erasure_index, 2, "EcIndex should be 2");
+
+        // Distribution array (16 disks total: 12 data + 4 parity)
+        assert_eq!(meta.distribution.len(), 16, "should have 16 disks in distribution");
+        assert_eq!(
+            meta.distribution,
+            vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1],
+            "distribution should match expected order"
+        );
+
+        // Parts count
+        assert_eq!(meta.parts.len(), 9016, "should have 9016 parts");
+
+        // Verify version type is Object (not delete marker)
+        assert_eq!(meta.version_type, VersionType::Object);
+
+        // data_dir should not be zero (valid UUID)
+        assert!(!meta.data_dir.is_zero(), "data_dir should be set");
+    }
+
+    /// Test parsing cicd-corpus xl.meta (disk2).
+    /// Expected values:
+    /// - data_blocks (EcM): 3
+    /// - parity_blocks (EcN): 2
+    /// - block_size: 1048576 (1 MiB)
+    /// - distribution: [3, 4, 5, 1, 2]
+    /// - ec_index: 4 (disk2's position)
+    /// - size: 644520 bytes
+    /// - content_type: "application/octet-stream"
+    /// - etag: "9587ddd31fead633830366f45d221d56"
+    #[test]
+    fn test_parse_cicd_corpus_xlmeta_disk2() {
+        let data = read_fixture("cicd-corpus/disk2/bucket/testobj/xl.meta");
+        let meta = parse(&data).expect("failed to parse cicd-corpus disk2 xl.meta");
+
+        // Erasure coding parameters
+        assert_eq!(meta.data_blocks, 3, "EcM should be 3");
+        assert_eq!(meta.parity_blocks, 2, "EcN should be 2");
+        assert_eq!(meta.block_size, 1048576, "EcBSize should be 1 MiB");
+        assert_eq!(meta.erasure_index, 4, "EcIndex should be 4 for disk2");
+
+        // Distribution array (5 disks total: 3 data + 2 parity)
+        assert_eq!(meta.distribution.len(), 5, "should have 5 disks in distribution");
+        assert_eq!(
+            meta.distribution,
+            vec![3, 4, 5, 1, 2],
+            "distribution should match expected order"
+        );
+
+        // Object size
+        assert_eq!(meta.size, 644520, "size should be 644520 bytes");
+
+        // Single part with same size
+        assert_eq!(meta.parts.len(), 1, "should have 1 part");
+        assert_eq!(meta.parts[0].size, 644520, "part size should match object size");
+
+        // Metadata
+        assert_eq!(
+            meta.content_type,
+            "application/octet-stream",
+            "content-type should be application/octet-stream"
+        );
+        assert_eq!(
+            meta.etag,
+            "9587ddd31fead633830366f45d221d56",
+            "etag should match"
+        );
+
+        // Version type
+        assert_eq!(meta.version_type, VersionType::Object);
+
+        // Data dir UUID should not be zero
+        assert!(!meta.data_dir.is_zero(), "data_dir should be set");
+
+        // Verify data_dir UUID format
+        let data_dir_str = meta.data_dir_string();
+        assert!(
+            data_dir_str.contains("-"),
+            "data_dir should be a valid UUID string: {}",
+            data_dir_str
+        );
+    }
+
+    /// Test that different disks in the cicd-corpus have different ec_index values.
+    #[test]
+    fn test_parse_cicd_corpus_ec_index_varies_by_disk() {
+        // Parse xl.meta from multiple disks
+        let disks_and_expected_ec_index = [
+            ("cicd-corpus/disk2/bucket/testobj/xl.meta", 4),
+            ("cicd-corpus/disk3/bucket/testobj/xl.meta", 5),
+            ("cicd-corpus/disk4/bucket/testobj/xl.meta", 1),
+            ("cicd-corpus/disk5/bucket/testobj/xl.meta", 2),
+        ];
+
+        for (fixture_path, expected_ec_index) in disks_and_expected_ec_index {
+            let data = read_fixture(fixture_path);
+            let meta = parse(&data).unwrap_or_else(|e| {
+                panic!("failed to parse {}: {}", fixture_path, e)
+            });
+
+            assert_eq!(
+                meta.erasure_index, expected_ec_index,
+                "erasure_index mismatch for {}: expected {}, got {}",
+                fixture_path, expected_ec_index, meta.erasure_index
+            );
+
+            // All disks should have same distribution (it's a property of the object, not the disk)
+            assert_eq!(
+                meta.distribution,
+                vec![3, 4, 5, 1, 2],
+                "distribution should be consistent across all disks for {}",
+                fixture_path
+            );
+        }
+    }
+
+    /// Test that cicd-corpus disks have consistent erasure coding config.
+    /// Note: The cicd-corpus contains disks with different object versions:
+    /// - disk2/disk3: older version (50051050-62bc-4928-...)
+    /// - disk4/disk5: newer version (163c7c9d-e856-41ed-...)
+    /// But erasure config, size, and etag remain consistent.
+    #[test]
+    fn test_parse_cicd_corpus_consistency() {
+        let fixtures = [
+            "cicd-corpus/disk2/bucket/testobj/xl.meta",
+            "cicd-corpus/disk3/bucket/testobj/xl.meta",
+            "cicd-corpus/disk4/bucket/testobj/xl.meta",
+            "cicd-corpus/disk5/bucket/testobj/xl.meta",
+        ];
+
+        let metas: Vec<_> = fixtures
+            .iter()
+            .map(|f| parse(&read_fixture(f)).unwrap())
+            .collect();
+
+        // All should have same erasure coding config (cluster-level property)
+        for (i, meta) in metas.iter().enumerate() {
+            assert_eq!(meta.data_blocks, 3, "disk{} data_blocks", i + 2);
+            assert_eq!(meta.parity_blocks, 2, "disk{} parity_blocks", i + 2);
+            assert_eq!(meta.block_size, 1048576, "disk{} block_size", i + 2);
+            assert_eq!(meta.distribution, vec![3, 4, 5, 1, 2], "disk{} distribution", i + 2);
+        }
+
+        // All versions of this object have same size and etag (object content is the same)
+        for (i, meta) in metas.iter().enumerate() {
+            assert_eq!(meta.size, 644520, "disk{} size", i + 2);
+            assert_eq!(meta.etag, "9587ddd31fead633830366f45d221d56", "disk{} etag", i + 2);
+        }
+
+        // Verify the version grouping: disk2+disk3 have same version, disk4+disk5 have same version
+        assert_eq!(
+            metas[0].version_id, metas[1].version_id,
+            "disk2 and disk3 should have same version"
+        );
+        assert_eq!(
+            metas[2].version_id, metas[3].version_id,
+            "disk4 and disk5 should have same version"
+        );
+        assert_ne!(
+            metas[0].version_id, metas[2].version_id,
+            "disk2/3 and disk4/5 should have different versions (replication in progress)"
+        );
+    }
+
+    /// Test computed properties on ObjectMeta.
+    #[test]
+    fn test_object_meta_computed_properties() {
+        let data = read_fixture("cicd-corpus/disk2/bucket/testobj/xl.meta");
+        let meta = parse(&data).unwrap();
+
+        // shard_size = ceil(block_size / data_blocks) = ceil(1048576 / 3) = 349526
+        assert_eq!(meta.shard_size(), 349526);
+
+        // total_shards = data_blocks + parity_blocks = 3 + 2 = 5
+        assert_eq!(meta.total_shards(), 5);
+    }
+
+    /// Test shard_size calculation for xl-many-parts fixture.
+    #[test]
+    fn test_shard_size_many_parts() {
+        let data = read_fixture("xlmeta/xl-many-parts.meta");
+        let meta = parse(&data).unwrap();
+
+        // shard_size = ceil(1048576 / 12) = 87382
+        assert_eq!(meta.shard_size(), 87382);
+        assert_eq!(meta.total_shards(), 16);
     }
 }

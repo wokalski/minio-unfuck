@@ -2271,18 +2271,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "duckdb",
- "highway",
  "io-uring",
+ "minio-format",
  "nix",
- "reed-solomon-erasure",
- "rmp",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
  "uuid",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -2296,6 +2293,20 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minio-format"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "highway",
+ "reed-solomon-erasure",
+ "rmp",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "miniz_oxide"

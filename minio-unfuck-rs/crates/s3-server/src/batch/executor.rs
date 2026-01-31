@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use mfu_core::erasure;
-use mfu_core::types::{ObjectMeta, PartMeta, Uuid16};
+use mfu_core::{ObjectMeta, PartMeta, Uuid16};
 
 use crate::cluster::ClusterConfig;
 use crate::db::{self, StoredObject};

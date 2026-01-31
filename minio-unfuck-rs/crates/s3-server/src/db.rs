@@ -311,18 +311,8 @@ pub async fn resolve_path(
     device_id: i32,
     path: &str,
 ) -> Result<Option<i64>> {
-    // Get root inode (parent_ino where no entry has it as child)
-    let root_ino: i64 = client
-        .query(
-            "SELECT DISTINCT parent_ino
-             FROM dirs
-             WHERE device_id = ?
-             LIMIT 1",
-        )
-        .bind(device_id)
-        .fetch_one()
-        .await
-        .context("get root inode")?;
+    // XFS root inode is always 128
+    let root_ino: i64 = 128;
 
     let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let mut current_ino = root_ino;

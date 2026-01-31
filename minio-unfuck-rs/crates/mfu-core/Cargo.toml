@@ -4,18 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Re-export minio-format for MinIO-specific parsing
+minio-format = { path = "../minio-format" }
+
+# Core dependencies
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-rmp = { workspace = true }
-duckdb = { workspace = true }
-reed-solomon-erasure = { workspace = true }
-highway = { workspace = true }
-xxhash-rust = { workspace = true }
 tracing = { workspace = true }
 nix = { workspace = true }
+
+# Database
+duckdb = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }

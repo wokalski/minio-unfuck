@@ -1,0 +1,6 @@
+# Mark binary test files
+*.meta binary
+*.gz binary
+*.zst binary
+*.zip binary
+part.* binary

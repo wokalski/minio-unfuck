@@ -5,7 +5,8 @@
 use anyhow::{Context, Result};
 use duckdb::{params, Appender, Connection};
 
-use crate::types::{Extent, ObjectMeta};
+use crate::types::Extent;
+use crate::ObjectMeta;
 
 const SCHEMA: &str = r#"
 -- All inodes from XFS scan (skip "." and "..")
