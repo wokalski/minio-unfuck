@@ -131,10 +131,16 @@ async fn run(args: Args) -> Result<()> {
         // Spawn producer task to stream extents from ClickHouse
         let producer_client = client.clone();
         let producer_handle = tokio::spawn(async move {
+            info!("Producer: starting extent query for device {}", device_id);
             let mut cursor = db::query_extents(&producer_client, device_id)?;
             let mut pending: HashMap<i64, PendingXlmeta> = HashMap::new();
 
+            let mut extents_received: u64 = 0;
+            let mut xlmetas_sent: u64 = 0;
+            let mut last_log = std::time::Instant::now();
+
             while let Some(row) = cursor.next().await? {
+                extents_received += 1;
                 let ino = row.xlmeta_ino;
 
                 let entry = pending.entry(ino).or_insert_with(|| PendingXlmeta {
@@ -166,10 +172,26 @@ async fn run(args: Args) -> Result<()> {
                     };
 
                     if ready_tx.send(ready).is_err() {
+                        info!("Producer: reader channel closed, stopping");
                         break; // Reader has terminated
                     }
+                    xlmetas_sent += 1;
+                }
+
+                // Log progress every 5 seconds
+                if last_log.elapsed().as_secs() >= 5 {
+                    info!(
+                        "Producer: {} extents received, {} xlmetas sent, {} pending inodes",
+                        extents_received, xlmetas_sent, pending.len()
+                    );
+                    last_log = std::time::Instant::now();
                 }
             }
+
+            info!(
+                "Producer: finished - {} extents received, {} xlmetas sent, {} incomplete inodes",
+                extents_received, xlmetas_sent, pending.len()
+            );
 
             Ok::<_, anyhow::Error>(())
         });

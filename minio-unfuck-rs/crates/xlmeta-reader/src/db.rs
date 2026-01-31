@@ -3,10 +3,12 @@
 //! Handles all ClickHouse queries and inserts.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clickhouse::query::RowCursor;
 use tokio::runtime::Handle;
+use tracing::info;
 
 use crate::types::{ChObject, ExtentRow};
 
@@ -86,7 +88,9 @@ pub async fn create_tmp_xlmetas(
     limit: Option<usize>,
 ) -> Result<TmpXlmetasGuard> {
     let limit_clause = limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
+    let start = Instant::now();
 
+    info!("DB: Cleaning up leftover tmp tables...");
     // Clean up any leftover tables
     client
         .query("DROP TABLE IF EXISTS tmp_xlmetas")
@@ -101,6 +105,8 @@ pub async fn create_tmp_xlmetas(
         .context("drop tmp_xlmetas_all")?;
 
     // Step 1: Create temp table with distinct xlmeta locations (no filtering yet)
+    info!("DB: Step 1/2 - Creating tmp_xlmetas_all with DISTINCT ON for device {}...", device_id);
+    let step1_start = Instant::now();
     let create_all = format!(
         r#"
         CREATE TABLE tmp_xlmetas_all ENGINE = Memory AS
@@ -123,7 +129,16 @@ pub async fn create_tmp_xlmetas(
         .await
         .context("create tmp_xlmetas_all")?;
 
+    let all_count: u64 = client
+        .query("SELECT count() FROM tmp_xlmetas_all")
+        .fetch_one()
+        .await
+        .context("count tmp_xlmetas_all")?;
+    info!("DB: Step 1/2 done - {} rows in {:.1}s", all_count, step1_start.elapsed().as_secs_f64());
+
     // Step 2: Create final table excluding objects that already exist
+    info!("DB: Step 2/2 - Filtering out existing objects...");
+    let step2_start = Instant::now();
     let create_filtered = r#"
         CREATE TABLE tmp_xlmetas ENGINE = Memory AS
         SELECT t.*
@@ -138,6 +153,7 @@ pub async fn create_tmp_xlmetas(
         .execute()
         .await
         .context("create tmp_xlmetas filtered")?;
+    info!("DB: Step 2/2 done in {:.1}s", step2_start.elapsed().as_secs_f64());
 
     // Clean up intermediate table
     client
@@ -152,6 +168,8 @@ pub async fn create_tmp_xlmetas(
         .await
         .context("count tmp_xlmetas")?;
 
+    info!("DB: tmp_xlmetas ready - {} objects to process (total time: {:.1}s)", count, start.elapsed().as_secs_f64());
+
     Ok(TmpXlmetasGuard {
         client,
         count,
@@ -164,6 +182,7 @@ pub fn query_extents(
     client: &clickhouse::Client,
     device_id: i32,
 ) -> Result<RowCursor<ExtentRow>> {
+    info!("DB: Starting extent query for device {} (streaming, ordered by physical_offset)...", device_id);
     let query = format!(
         r#"
         SELECT
