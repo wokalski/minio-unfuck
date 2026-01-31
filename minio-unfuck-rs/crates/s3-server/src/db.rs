@@ -350,9 +350,9 @@ pub async fn lookup_part_shards(
         .collect();
 
     // Query 1: Get device_id/ino from fs table
-    // Uses projection for processed parts, bloom_filter for the rest
+    // Disable projection (still materializing) and use bloom_filter index only
     let fs_query = format!(
-        "SELECT device_id, child_ino as ino, name FROM fs WHERE name IN ({})",
+        "SELECT device_id, child_ino as ino, name FROM fs WHERE name IN ({}) SETTINGS allow_experimental_projection_optimization = 0",
         paths_in.join(", ")
     );
 
