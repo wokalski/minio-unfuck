@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Re-export minio-format for MinIO-specific parsing
-minio-format = { path = "../minio-format" }
+minio-format = { git = "https://github.com/dialohq/minio-format-rs" }
 
 # Core dependencies
 anyhow = { workspace = true }

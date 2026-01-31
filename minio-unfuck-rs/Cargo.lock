@@ -2297,6 +2297,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "minio-format"
 version = "0.1.0"
+source = "git+https://github.com/dialohq/minio-format-rs#1abb363b78b44d8abba63f593bd02696af96e4ad"
 dependencies = [
  "anyhow",
  "highway",

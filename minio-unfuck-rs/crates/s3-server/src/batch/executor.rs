@@ -175,15 +175,8 @@ impl BatchExecutor {
 
         info!("Parts to read: {:?}", parts);
 
-        // Step 1: Collect all (part_number, device_id, ino, disk_idx) from fs lookups
-        struct PartLocation {
-            part_number: i32,
-            device_id: usize,
-            ino: i64,
-            disk_idx: usize,
-        }
-        let mut part_locations: Vec<PartLocation> = Vec::new();
-
+        // For each part, query fs table to get all device->inode mappings
+        // Then fetch extents and size per shard (fast enough, no need to batch CH queries)
         for part_number in parts {
             let full_path = format!(
                 "{}/{}/{}/part.{}",
@@ -196,6 +189,8 @@ impl BatchExecutor {
 
             for loc in locations {
                 let device_id = loc.device_id as usize;
+                let ino = loc.child_ino;
+
                 if device_id >= self.device_fds.len() {
                     continue;
                 }
@@ -210,47 +205,33 @@ impl BatchExecutor {
                     continue;
                 }
 
-                part_locations.push(PartLocation {
+                // Get extents
+                let extents = db::get_file_extents(&self.client, loc.device_id, ino).await?;
+                if extents.is_empty() {
+                    continue;
+                }
+
+                // Get file size
+                let size = db::get_inode_size(&self.client, loc.device_id, ino)
+                    .await?
+                    .unwrap_or(0);
+
+                if size == 0 {
+                    continue;
+                }
+
+                let first_phys_offset = extents.first().map(|e| e.physical_offset).unwrap_or(0);
+
+                plans.push(ShardReadPlan {
+                    request_id,
                     part_number,
+                    disk_index: disk_idx,
                     device_id,
-                    ino: loc.child_ino,
-                    disk_idx,
+                    extents,
+                    file_size: size as u64,
+                    first_phys_offset,
                 });
             }
-        }
-
-        if part_locations.is_empty() {
-            return Ok(plans);
-        }
-
-        // Step 2: Batch lookup extents and sizes in ONE query (JOIN)
-        let inode_keys: Vec<(i32, i64)> = part_locations
-            .iter()
-            .map(|p| (p.device_id as i32, p.ino))
-            .collect();
-
-        let extents_with_sizes = db::batch_get_extents_with_sizes(&self.client, &inode_keys).await?;
-
-        // Step 3: Build plans using collected data
-        for loc in part_locations {
-            let key = (loc.device_id as i32, loc.ino);
-
-            let (extents, size) = match extents_with_sizes.get(&key) {
-                Some((e, s)) if !e.is_empty() && *s > 0 => (e.clone(), *s),
-                _ => continue,
-            };
-
-            let first_phys_offset = extents.first().map(|e| e.physical_offset).unwrap_or(0);
-
-            plans.push(ShardReadPlan {
-                request_id,
-                part_number: loc.part_number,
-                disk_index: loc.disk_idx,
-                device_id: loc.device_id,
-                extents,
-                file_size: size as u64,
-                first_phys_offset,
-            });
         }
 
         Ok(plans)

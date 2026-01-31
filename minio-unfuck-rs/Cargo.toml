@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/minio-format",
     "crates/mfu-core",
     "crates/meta-reader",
     "crates/xlmeta-reader",
