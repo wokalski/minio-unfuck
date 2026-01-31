@@ -167,18 +167,23 @@ fn build_cluster_config(formats: &[(usize, DiskFormat)]) -> Result<ClusterConfig
             uuid_to_device.insert(fmt.xl.this_disk.clone(), *device_id);
         }
 
+        info!("Pool {}: {} devices, uuid_to_device has {} entries", pool_idx, disks_in_pool.len(), uuid_to_device.len());
+
         // Get sets configuration from any disk (they should all be the same)
         let sets_config = &disks_in_pool[0].1.xl.sets;
+        info!("Pool {}: format.json has {} sets", pool_idx, sets_config.len());
 
         let mut sets: Vec<Vec<DiskInfo>> = Vec::new();
         for (set_idx, set_uuids) in sets_config.iter().enumerate() {
             let mut disk_infos: Vec<DiskInfo> = Vec::new();
+            let mut found_count = 0;
             for (disk_idx, uuid) in set_uuids.iter().enumerate() {
                 let device_id = uuid_to_device.get(uuid).copied();
 
                 if let Some(dev_id) = device_id {
                     device_to_disk.insert(dev_id, (pool_idx, set_idx, disk_idx));
                     disk_to_device.insert((pool_idx, set_idx, disk_idx), dev_id);
+                    found_count += 1;
                 }
 
                 disk_infos.push(DiskInfo {
@@ -189,6 +194,7 @@ fn build_cluster_config(formats: &[(usize, DiskFormat)]) -> Result<ClusterConfig
                     device_id,
                 });
             }
+            info!("Pool {} set {}: {} disks in format.json, {} found on our devices", pool_idx, set_idx, set_uuids.len(), found_count);
             sets.push(disk_infos);
         }
 

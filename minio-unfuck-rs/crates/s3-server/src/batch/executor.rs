@@ -151,9 +151,15 @@ impl BatchExecutor {
         // Parse data_dir UUID
         let data_dir = &obj.data_dir;
 
+        // Determine pool/set from xlmeta_device_id
+        let (pool_idx, set_idx, _) = self
+            .cluster
+            .device_position(obj.xlmeta_device_id as usize)
+            .unwrap_or((0, 0, 0));
+
         debug!(
-            "Planning shard reads for {}/{}, data_dir={}, distribution={:?}",
-            obj.bucket, obj.key, data_dir, obj.distribution
+            "Planning shard reads for {}/{}, data_dir={}, distribution={:?}, xlmeta_device={}, pool={}, set={}",
+            obj.bucket, obj.key, data_dir, obj.distribution, obj.xlmeta_device_id, pool_idx, set_idx
         );
 
         // Parse parts JSON to get part numbers
@@ -172,12 +178,11 @@ impl BatchExecutor {
         // For each part, plan reads for each disk in the distribution
         for part_number in parts {
             for (disk_idx, &shard_num) in obj.distribution.iter().enumerate() {
-                // Get device_id for this disk
-                // TODO: Need pool_index and set_index from object metadata
-                let device_id = match self.cluster.disk_index_to_device(0, 0, disk_idx) {
+                // Get device_id for this disk using the correct pool/set
+                let device_id = match self.cluster.disk_index_to_device(pool_idx, set_idx, disk_idx) {
                     Some(id) => id,
                     None => {
-                        debug!("disk_idx {} has no device mapping", disk_idx);
+                        debug!("disk_idx {} has no device mapping (pool={}, set={})", disk_idx, pool_idx, set_idx);
                         continue;
                     }
                 };
