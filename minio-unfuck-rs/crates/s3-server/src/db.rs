@@ -378,7 +378,8 @@ pub async fn lookup_part_shards(
         size: i64,
     }
 
-    let rows: Vec<RowWithName> = client.query(&query).fetch_all().await.context("lookup part shards")?;
+    let rows: Vec<RowWithName> = client.query(&query).fetch_all().await
+        .map_err(|e| anyhow::anyhow!("lookup part shards: {}", e))?;
 
     // Group by path
     let mut result: HashMap<String, Vec<PartShardInfo>> = HashMap::new();
