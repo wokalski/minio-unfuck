@@ -314,9 +314,9 @@ pub async fn batch_get_inode_sizes(
     Ok(result)
 }
 
-/// Combined extent + size lookup in one query (JOIN)
+/// Result of the combined part lookup query
 #[derive(Debug, Clone, Row, Deserialize)]
-pub struct ExtentWithSize {
+pub struct PartShardInfo {
     pub device_id: i32,
     pub ino: i64,
     pub logical_offset: i64,
@@ -325,45 +325,72 @@ pub struct ExtentWithSize {
     pub size: i64,
 }
 
-/// Batch get extents and sizes in a single query using JOIN
-pub async fn batch_get_extents_with_sizes(
+/// Lookup all shard extents + sizes for given part paths in ONE query
+/// Uses CTEs to pre-filter and avoid expensive full-table JOINs
+pub async fn lookup_part_shards(
     client: &clickhouse::Client,
-    keys: &[(i32, i64)],
-) -> Result<HashMap<(i32, i64), (Vec<Extent>, i64)>> {
-    if keys.is_empty() {
+    part_paths: &[String],
+) -> Result<HashMap<String, Vec<PartShardInfo>>> {
+    if part_paths.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let in_clause: Vec<String> = keys
+    // Build IN clause for paths
+    let paths_in: Vec<String> = part_paths
         .iter()
-        .map(|(d, i)| format!("({}, {})", d, i))
+        .map(|p| format!("'{}'", escape_str(p)))
         .collect();
 
     let query = format!(
-        "SELECT e.device_id, e.ino, e.logical_offset, e.physical_offset, e.length, i.size
-         FROM file_extents e
-         JOIN inodes i ON e.device_id = i.device_id AND e.ino = i.ino
-         WHERE (e.device_id, e.ino) IN ({})
-         ORDER BY e.device_id, e.ino, e.logical_offset",
-        in_clause.join(", ")
+        r#"
+        WITH
+            part_inodes AS (
+                SELECT device_id, child_ino as ino, name FROM fs
+                WHERE name IN ({})
+            ),
+            part_extents AS (
+                SELECT device_id, ino, logical_offset, physical_offset, length
+                FROM file_extents
+                WHERE (device_id, ino) IN (SELECT device_id, ino FROM part_inodes)
+            ),
+            part_sizes AS (
+                SELECT device_id, ino, size
+                FROM inodes
+                WHERE (device_id, ino) IN (SELECT device_id, ino FROM part_inodes)
+            )
+        SELECT p.name, e.device_id, e.ino, e.logical_offset, e.physical_offset, e.length, s.size
+        FROM part_inodes p
+        JOIN part_extents e ON p.device_id = e.device_id AND p.ino = e.ino
+        JOIN part_sizes s ON e.device_id = s.device_id AND e.ino = s.ino
+        ORDER BY p.name, e.device_id, e.logical_offset
+        "#,
+        paths_in.join(", ")
     );
 
-    let rows: Vec<ExtentWithSize> = client.query(&query).fetch_all().await.context("batch get extents with sizes")?;
+    #[derive(Debug, Clone, Row, Deserialize)]
+    struct RowWithName {
+        name: String,
+        device_id: i32,
+        ino: i64,
+        logical_offset: i64,
+        physical_offset: i64,
+        length: i64,
+        size: i64,
+    }
 
-    // Group by (device_id, ino)
-    let mut result: HashMap<(i32, i64), (Vec<Extent>, i64)> = HashMap::new();
+    let rows: Vec<RowWithName> = client.query(&query).fetch_all().await.context("lookup part shards")?;
 
+    // Group by path
+    let mut result: HashMap<String, Vec<PartShardInfo>> = HashMap::new();
     for row in rows {
-        let key = (row.device_id, row.ino);
-        let extent = Extent {
+        result.entry(row.name.clone()).or_default().push(PartShardInfo {
+            device_id: row.device_id,
+            ino: row.ino,
             logical_offset: row.logical_offset,
             physical_offset: row.physical_offset,
             length: row.length,
-        };
-
-        result.entry(key)
-            .or_insert_with(|| (Vec::new(), row.size))
-            .0.push(extent);
+            size: row.size,
+        });
     }
 
     Ok(result)

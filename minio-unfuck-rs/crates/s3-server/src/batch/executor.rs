@@ -173,23 +173,39 @@ impl BatchExecutor {
                 .collect()
         };
 
-        info!("Parts to read: {:?}", parts);
+        debug!("Parts to read: {:?}", parts);
 
-        // For each part, query fs table to get all device->inode mappings
-        // Then fetch extents and size per shard (fast enough, no need to batch CH queries)
+        // Build all part paths for single query
+        let part_paths: Vec<String> = parts
+            .iter()
+            .map(|&n| format!("{}/{}/{}/part.{}", obj.bucket, obj.key, data_dir, n))
+            .collect();
+
+        // ONE query to get all shard info (fs + extents + sizes)
+        let shards_by_path = db::lookup_part_shards(&self.client, &part_paths).await?;
+
+        // Build plans from results
         for part_number in parts {
-            let full_path = format!(
-                "{}/{}/{}/part.{}",
-                obj.bucket, obj.key, data_dir, part_number
-            );
+            let path = format!("{}/{}/{}/part.{}", obj.bucket, obj.key, data_dir, part_number);
 
-            let locations = db::lookup_part_by_path(&self.client, &full_path).await?;
+            let Some(shards) = shards_by_path.get(&path) else {
+                continue;
+            };
 
-            debug!("Found {} locations for {}", locations.len(), full_path);
+            // Group extents by (device_id, ino) since query returns one row per extent
+            let mut by_device: HashMap<(i32, i64), (Vec<mfu_core::types::Extent>, i64)> = HashMap::new();
+            for shard in shards {
+                let key = (shard.device_id, shard.ino);
+                let entry = by_device.entry(key).or_insert_with(|| (Vec::new(), shard.size));
+                entry.0.push(mfu_core::types::Extent {
+                    logical_offset: shard.logical_offset,
+                    physical_offset: shard.physical_offset,
+                    length: shard.length,
+                });
+            }
 
-            for loc in locations {
-                let device_id = loc.device_id as usize;
-                let ino = loc.child_ino;
+            for ((device_id, _ino), (extents, size)) in by_device {
+                let device_id = device_id as usize;
 
                 if device_id >= self.device_fds.len() {
                     continue;
@@ -201,22 +217,7 @@ impl BatchExecutor {
                 };
 
                 let shard_num = obj.distribution.get(disk_idx).copied().unwrap_or(0);
-                if shard_num == 0 {
-                    continue;
-                }
-
-                // Get extents
-                let extents = db::get_file_extents(&self.client, loc.device_id, ino).await?;
-                if extents.is_empty() {
-                    continue;
-                }
-
-                // Get file size
-                let size = db::get_inode_size(&self.client, loc.device_id, ino)
-                    .await?
-                    .unwrap_or(0);
-
-                if size == 0 {
+                if shard_num == 0 || extents.is_empty() || size == 0 {
                     continue;
                 }
 
