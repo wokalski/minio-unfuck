@@ -263,7 +263,15 @@ impl BatchExecutor {
 
         let file = &self.device_fds[plan.device_id];
         let fd = file.as_raw_fd();
-        let mut buffer = vec![0u8; plan.file_size as usize];
+
+        // Calculate buffer size as max of inode size and extent coverage
+        let extent_coverage = plan.extents
+            .iter()
+            .map(|e| (e.logical_offset + e.length) as u64)
+            .max()
+            .unwrap_or(0);
+        let buffer_size = std::cmp::max(plan.file_size, extent_coverage) as usize;
+        let mut buffer = vec![0u8; buffer_size];
 
         for extent in &plan.extents {
             let buf_start = extent.logical_offset as usize;
@@ -288,6 +296,8 @@ impl BatchExecutor {
             }
         }
 
+        // Truncate to actual file size
+        buffer.truncate(plan.file_size as usize);
         Some(buffer)
     }
 
