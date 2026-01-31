@@ -349,9 +349,9 @@ pub async fn lookup_part_shards(
         .map(|p| format!("'{}'", escape_str(p)))
         .collect();
 
-    // Query 1: Get device_id/ino from fs_by_name table (fast ORDER BY name lookup)
+    // Query 1: Get device_id/ino from fs table using projection (fast ORDER BY name lookup)
     let fs_query = format!(
-        "SELECT device_id, child_ino as ino, name FROM fs_by_name WHERE name IN ({})",
+        "SELECT device_id, child_ino as ino, name FROM fs WHERE name IN ({}) SETTINGS force_optimize_projection = 1",
         paths_in.join(", ")
     );
 
